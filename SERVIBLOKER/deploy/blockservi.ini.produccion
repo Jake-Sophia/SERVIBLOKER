@@ -1,0 +1,31 @@
+[general]
+domain = unlockersserver.com
+portal_host = vpnk.unlockersserver.com
+device_dns_suffix = dns.unlockersserver.com
+device_prefix = dev-
+admin_key = CAMBIAR_ANTES_DE_USAR
+data_dir = /var/lib/blockservi
+state_file = /var/lib/blockservi/devices.json
+licenses_file = /var/lib/blockservi/licenses.json
+policy_file = /var/lib/blockservi/policy.json
+log_file = /var/lib/blockservi/blocked.log
+log_max_bytes = 8388608
+unlock_hours = 24
+request_hours = 24
+blocked_rcode = nxdomain
+captive_ip = 209.145.55.123
+
+[network]
+http_host = 127.0.0.1
+http_port = 8080
+plain_host = 127.0.0.1
+plain_port = 5353
+doh_path = /dns-query
+
+[upstream]
+doh = https://1.1.1.1/dns-query,https://dns.google/dns-query
+udp = 
+timeout = 5
+cache_ttl = 300
+cache_max = 20000
+

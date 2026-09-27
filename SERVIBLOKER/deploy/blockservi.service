@@ -1,0 +1,28 @@
+[Unit]
+Description=blockservi - filtro de acceso DNS con activacion por codigo
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=blockservi
+Group=blockservi
+WorkingDirectory=/opt/blockservi
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/blockservi/.venv/bin/python -m blockservi --config /etc/blockservi/blockservi.ini serve
+Restart=always
+RestartSec=3
+LimitNOFILE=65535
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+ReadWritePaths=/var/lib/blockservi
+
+[Install]
+WantedBy=multi-user.target

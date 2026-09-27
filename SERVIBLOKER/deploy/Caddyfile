@@ -1,0 +1,57 @@
+# Caddy termina el TLS y reenvia al servicio, que habla HTTP plano en 127.0.0.1:8080.
+#
+# Sustituye el correo por el tuyo: Caddy lo usa para avisarte de caducidades.
+# El DNS de los dispositivos (dev-*.dns.unlockersserver.com) debe quedar en
+# Cloudflare como DNS only (nube gris). Si lo proxysas, Cloudflare se interpone
+# en las consultas DoH y el filtrado por token deja de funcionar.
+
+{
+	email PON-TU-CORREO-AQUI
+
+	# Importante: ZeroSSL, la CA por defecto de Caddy, solo admite dns-01, que
+	# exigiria crear un API token en Cloudflare. Let's Encrypt admite tls-alpn-01
+	# para comodines, asi que no hace falta tocar las credenciales de nada.
+	acme_ca https://acme-v02.api.letsencrypt.org/directory
+}
+
+# Portal de activacion y descarga de perfiles
+vpnk.unlockersserver.com {
+	encode zstd gzip
+	reverse_proxy 127.0.0.1:8080
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+	log {
+		output file /var/log/caddy/blockservi-access.log
+		format json
+	}
+}
+
+# Portal cautivo: lo bloqueado resuelve a la IP del servidor, y al abrir
+# cualquier app o pagina cae aqui con el Host que el movil estaba pidiendo.
+#
+# Solo en HTTP a proposito: al teclear un dominio el navegador empieza por
+# http:// y asi ve la pantalla. En HTTPS haria falta un certificado para cada
+# dominio bloqueado, que no se puede tener.
+:80 {
+	reverse_proxy 127.0.0.1:8080
+	log {
+		output file /var/log/caddy/blockservi-cautivo.log
+		format json
+	}
+}
+
+# DNS cifrado de cada dispositivo.
+#
+# Sin comodin a proposito: Let's Encrypt solo ofrece dns-01 para los comodines,
+# que obligaria a crear un API token en Cloudflare. En cambio cada dispositivo
+# tiene su host explicito, que si se pide por HTTP-01 sin tocar credenciales.
+# El DNS si puede ser un comodin (*.dns.unlockersserver.com): ahi solo resuelve.
+#
+# Tras dar de alta un telefono:
+#   blockservi device caddy --caddy-dir /etc/caddy/dispositivos
+#   systemctl reload caddy
+import /etc/caddy/dispositivos/*.caddy

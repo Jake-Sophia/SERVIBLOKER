@@ -1,0 +1,82 @@
+{
+  "_documentacion": [
+    "Listas de dominio del filtro. Formato por entrada:",
+    "  youtube.com        -> coincide youtube.com y cualquier subdominio",
+    "  =youtube.com       -> coincide solo el nombre exacto",
+    "  re:^regex$         -> expresion regular sobre el nombre en minusculas",
+    "Las lineas que empiezan por # se ignoran. Recarga el servicio tras editar.",
+    "deny_always      se aplica SIEMPRE, incluso con codigo activado.",
+    "allow_strict     se aplica siempre: es lo unico que resuelve sin codigo.",
+    "allow_strict_optional  solo en modo estricto y solo si strict_push=true.",
+    "Con codigo activado se permite cualquier dominio que no este en deny_always."
+  ],
+
+  "strict_push": false,
+
+  "deny_always": [
+    "# --- iTunes / App Store / Books ---",
+    "itunes.apple.com",
+    "apps.apple.com",
+    "books.apple.com",
+    "ibooks.apple.com",
+    "phobos.apple.com",
+    "xp.apple.com",
+    "mzstatic.com",
+    "bookspublishing.apple.com",
+    "# --- Localizacion y Buscar mi iPhone ---",
+    "re:^p[0-9]+-fmip\\.icloud\\.com$",
+    "=fmip.fe2.apple-dns.net",
+    "ls.apple.com",
+    "p01-contactsync.icloud.com",
+    "p00-contactsync.icloud.com",
+    "p01-contactsync-set.icloud.com",
+    "fmzmobile.icloud.com",
+    "fmzweb.icloud.com",
+    "p01-fm.icloud.com",
+    "p00-fm.icloud.com",
+    "p01-device.icloud.com",
+    "findme.apple.com",
+    "# --- Resolventores DoH/DoQ: impiden que una app se salte el filtro ---",
+    "cloudflare-dns.com",
+    "mozilla.cloudflare-dns.com",
+    "dns.google",
+    "doh.opendns.com",
+    "opendns.com",
+    "dns.quad9.net",
+    "dns.adguard-dns.com",
+    "doh.mullvad.net",
+    "dns.nextdns.io",
+    "dns.digitale-gesellschaft.ch",
+    "dot.pub",
+    "doh.tiar.app",
+    "sdns.io"
+  ],
+
+  "allow_strict": [
+    "# --- Solo el servicio: generador, perfil y VPN. ---",
+    "=vpn.unlockersserver.com",
+    "=vpnk.unlockersserver.com",
+    "=codigos.unlockersserver.com"
+  ],
+
+  "allow_strict_optional": [
+    "# Avisos push de Google (YouTube). Son infraestructura compartida:",
+    "si los borras, las notificaciones de YouTube dejan de llegar.",
+    "mtalk.google.com",
+    "fcm.googleapis.com",
+    "firebaseinstallations.googleapis.com",
+    "android.googleapis.com"
+  ],
+
+  "blocked_qtypes": [
+    "PTR",
+    "DNSKEY",
+    "DS",
+    "RRSIG",
+    "NSEC",
+    "NSEC3",
+    "NSEC3PARAM",
+    "TA",
+    "DLV"
+  ]
+}

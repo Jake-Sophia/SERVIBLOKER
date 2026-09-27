@@ -1,0 +1,62 @@
+[general]
+; Dominio que usas en Cloudflare. El DNS de cada dispositivo vivira debajo de el.
+domain = ejemplo.com
+
+; Host que sirve la pagina de activacion y los perfiles. Debe estar en la lista
+; blanca o losempleados no podran introducir el codigo.
+portal_host = app.ejemplo.com
+
+; Los dispositivos consultan https://dev-<token>.dns.ejemplo.com/dns-query
+device_dns_suffix = dns.ejemplo.com
+device_prefix = dev-
+
+; Clave de la API y de la descarga de perfiles. Cambiala por una larga y aleatoria.
+admin_key = CAMBIA-ESTA-CLAVE-LARGA-Y-ALEATORIA
+
+data_dir = /var/lib/blockservi
+state_file = /var/lib/blockservi/devices.json
+
+; El mismo licenses.json que genera el panel PHP de licencias.
+licenses_file = /var/lib/blockservi/licenses.json
+
+policy_file = /var/lib/blockservi/policy.json
+log_file = /var/lib/blockservi/blocked.log
+log_max_bytes = 8388608
+
+; Horas de acceso completo tras introducir un codigo valido.
+unlock_hours = 24
+
+; Horas que concede el panel al autorizar un codigo solicitado por el movil.
+request_hours = 24
+
+; nxdomain o refused. nxdomain es mas rapido para que la app caiga.
+blocked_rcode = nxdomain
+
+; Portal cautivo. Escribe aqui la IP publica del servidor y lo que este
+; bloqueado resolvera a ella, de modo que al abrir una app el movil caiga en
+; la pantalla del codigo en vez de quedarse sin conexion. Vacio = NXDOMAIN.
+; El bloqueo permanente (App Store, Find My...) no usa esta IP.
+captive_ip =
+
+; Si es 1, las consultas que no llegan con un token de dispositivo conocido
+; se tratan como modo estricto. No lo pongas a 0 en produccion.
+require_token = 1
+
+[network]
+; El servicio escucha en HTTP plano. El TLS lo pone Caddy o Nginx delante.
+http_host = 127.0.0.1
+http_port = 8080
+
+; DNS en claro, solo para el propio VPS y para pruebas.
+plain_host = 127.0.0.1
+plain_port = 5353
+
+doh_path = /dns-query
+
+[upstream]
+doh = https://1.1.1.1/dns-query,https://dns.google/dns-query
+; Resolventes UDP opcionales, separados por comas.
+udp =
+timeout = 5
+cache_ttl = 300
+cache_max = 20000
