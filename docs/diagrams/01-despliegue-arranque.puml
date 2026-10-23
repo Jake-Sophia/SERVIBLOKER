@@ -1,0 +1,125 @@
+@startuml
+title SERVIBLOKER - 01 - Despliegue y arranque
+skinparam shadowing false
+skinparam activity {
+  BackgroundColor #EAF3FF
+  BorderColor #37618C
+  DiamondBackgroundColor #FFF2D5
+  DiamondBorderColor #A47A26
+  FontColor #142C44
+}
+skinparam ArrowColor #37618C
+
+start
+partition "ADMINISTRADOR / VPS" {
+  :Obtener repositorio SERVIBLOKER;
+  :Preparar archivos del proyecto;
+  :Seleccionar configuración de producción;
+  if (¿Ejecutar instalación completa?) then (Sí)
+    :Ejecutar deploy/desplegar-vps.sh;
+    :Comprobar permisos root y configuración;
+    if (¿Requisitos correctos?) then (Sí)
+      :Inspeccionar Nginx y puertos;
+      if (¿Nginx activo?) then (Sí)
+        :Respaldar configuración Nginx;
+        :Detener y deshabilitar Nginx;
+      endif
+      :Instalar o verificar Caddy;
+    else (No)
+      :Registrar error de despliegue;
+      stop
+    endif
+  else (No)
+    :Ejecutar deploy/install.sh;
+  endif
+}
+partition "INSTALADOR" {
+  :Instalar Python, venv, pip y certificados;
+  :Crear usuario de sistema blockservi;
+  :Copiar paquete Python a /opt/blockservi;
+  :Crear directorio /var/lib/blockservi;
+  if (¿Ya existe policy.json?) then (Sí)
+    :Conservar política existente;
+  else (No)
+    :Copiar política del repositorio;
+  endif
+  :Crear entorno virtual;
+  :Instalar aiohttp, dnslib y certifi;
+  :Instalar blockservi.ini;
+  :Configurar propietarios y permisos;
+  :Crear comando CLI /usr/local/bin/blockservi;
+  :Registrar unidad systemd;
+  :Habilitar y reiniciar servicio;
+  if (¿Servicio systemd activo?) then (No)
+    :Mostrar estado y registros del servicio;
+    stop
+  endif
+}
+partition "PROXY INVERSO" {
+  :Preparar Caddyfile;
+  :Configurar dominio del portal;
+  :Configurar proxy HTTP hacia 127.0.0.1:8080;
+  :Habilitar HTTP puerto 80 y HTTPS puerto 443;
+  :Importar hosts individuales de dispositivos;
+  :Solicitar certificados TLS mediante ACME;
+  if (¿Certificados y DNS correctos?) then (No)
+    :Registrar incidencia de proxy o TLS;
+    :Requiere corrección de infraestructura;
+  else (Sí)
+    :Portal HTTPS accesible;
+  endif
+}
+partition "PYTHON - MAIN / CLI" {
+  :python -m blockservi serve;
+  :ArgumentParser procesa --config;
+  :Config.load lee archivo INI;
+  :Validar dominio, admin_key e IPv4 cautiva;
+  if (¿Configuración válida?) then (No)
+    :ConfigError;
+    :Finalizar con código de error;
+    stop
+  endif
+}
+partition "INICIALIZACIÓN DE COMPONENTES" {
+  :Cargar Policy desde policy.json;
+  :Agregar portal, dominio y sufijo DNS
+  a lista de permitidos;
+  :Inicializar Store con devices.json;
+  :Inicializar Licenses con licenses.json;
+  :Inicializar Codes con codes.json;
+  :Inicializar ApiKeys con api_keys.json;
+  :Inicializar QueryLog con blocked.log;
+  :Crear Upstream con resolventes configurados;
+  :Crear Filter con Policy, Store,
+  Upstream y QueryLog;
+  :Crear Service con todos los componentes;
+}
+partition "SERVIDORES" {
+  :Crear aiohttp.ClientSession;
+  :Asignar sesión a Upstream;
+  :Registrar rutas mediante build_app();
+  :Iniciar servidor HTTP aiohttp;
+  :Crear PlainBridge;
+  :Iniciar DNS UDP local;
+  :Iniciar DNS TCP local;
+  :Registrar señales SIGINT y SIGTERM;
+}
+partition "OPERACIÓN" {
+  while (¿No se recibió señal de parada?) is (Sí)
+    :Atender solicitudes HTTP y DoH;
+    :Atender DNS UDP/TCP;
+    :Procesar portal, panel y API;
+    :Aplicar reglas y guardar cambios;
+    :Consultar estadísticas y registros;
+  endwhile (No)
+}
+partition "CIERRE CONTROLADO" {
+  :Detener servidores DNS;
+  :Limpiar AppRunner de aiohttp;
+  :Cerrar ClientSession;
+  :Ejecutar Store.flush();
+  :Persistir cambios pendientes;
+  :Finalizar proceso;
+}
+stop
+@enduml
