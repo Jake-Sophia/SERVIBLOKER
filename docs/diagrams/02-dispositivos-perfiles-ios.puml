@@ -1,0 +1,129 @@
+@startuml
+title SERVIBLOKER - 02 - Dispositivos y perfiles iOS
+skinparam shadowing false
+skinparam activity {
+ BackgroundColor #E8F4FF
+ BorderColor #37618C
+ DiamondBackgroundColor #FFF1CC
+}
+
+start
+:Administrador necesita configurar iPhone;
+if (¿Tipo de instalación?) then (Perfil compartido)
+  :Seleccionar perfil único para todos;
+  if (¿Descarga desde /config?) then (Sí)
+    :GET /config;
+    note right
+      Ruta pública.
+      No exige admin_key.
+    end note
+  else (No)
+    :GET /perfil/bloqueoservi.mobileconfig;
+    :Obtener k o X-Admin-Key;
+    if (¿Clave de administrador válida?) then (No)
+      :HTTP 401;
+      stop
+    endif
+  endif
+  :Token lógico = todos;
+  :Usar URL DoH compartida;
+  :https://portal/dns-query;
+  :La identidad operativa será la IP;
+elseif (¿Tipo de instalación?) then (Perfil individual)
+  :Ejecutar blockservi device add;
+  :Leer label y code opcionales;
+  :Generar token con secrets.token_hex(6);
+  while (¿Token ya existe?) is (Sí)
+    :Generar otro token;
+  endwhile (No)
+  :Crear dispositivo;
+  :unlocked_until = 0;
+  :unlock_count = 0;
+  :request_code = vacío;
+  :created_at = ahora;
+  :Guardar en devices.json;
+  :Construir host dev-token.dns.dominio;
+  :Construir URL de activación;
+  if (¿Generar configuración Caddy?) then (Sí)
+    :Recorrer dispositivos registrados;
+    :Crear un bloque .caddy por token;
+    :Asignar reverse_proxy a localhost:8080;
+    :Recargar Caddy de forma externa;
+    :Caddy solicita certificado del host;
+  endif
+  :GET /perfil/{token}.mobileconfig;
+  :Verificar admin_key;
+  if (¿Autorización correcta?) then (No)
+    :HTTP 401;
+    stop
+  endif
+  :Buscar dispositivo por token;
+  if (¿Existe?) then (No)
+    :HTTP 404;
+    stop
+  endif
+  :Configurar DoH específico del equipo;
+else (Perfil diagnóstico)
+  :GET /perfil/vpn-test.mobileconfig;
+  :Verificar admin_key;
+  if (¿Autorización correcta?) then (No)
+    :HTTP 401;
+    stop
+  endif
+  :Construir perfil VPN IKEv2 de prueba;
+  :No incluir configuración DNS;
+  :No incluir portal cautivo;
+endif
+
+partition "GENERACIÓN PLIST" {
+  if (¿Perfil VPN de diagnóstico?) then (Sí)
+    :Construir Payload VPN IKEv2;
+  else (No)
+    :Crear DNSSettings managed;
+    :Asignar DNSServerURLs;
+    :Crear Payload de portal cautivo;
+    :Configurar PortalURL /activar;
+    :Definir SupportedURLs;
+    if (¿vpn_enabled = true?) then (Sí)
+      :Agregar Payload VPN IKEv2;
+      :Configurar VPNSendAllTraffic;
+      :Configurar OnDemand para WiFi y Cellular;
+      :Asignar autenticación VPN;
+    else (No)
+      :Mantener perfil DNS y portal;
+    endif
+  endif
+  :Generar identificadores UUID deterministas;
+  :Serializar mediante plistlib;
+  :Entregar aplicación x-apple-aspen-config;
+}
+partition "INSTALACIÓN EN IPHONE" {
+  :Abrir archivo mobileconfig en iPhone;
+  :Usuario acepta instalar el perfil en Ajustes;
+  if (¿Instalación completada?) then (No)
+    :No queda configurado el perfil;
+    stop
+  endif
+  :iOS configura el servidor DNS cifrado;
+  if (¿Perfil contiene VPN?) then (Sí)
+    :iOS intenta establecer conexión IKEv2;
+    if (¿VPN se conecta?) then (No)
+      :El túnel no está operativo;
+      :Requiere diagnóstico de VPN;
+    else (Sí)
+      :Tráfico enviado por túnel configurado;
+    endif
+  endif
+  :Las aplicaciones realizan consultas DNS;
+  :iOS envía solicitudes al servicio DoH;
+  if (¿Host con token individual?) then (Sí)
+    :Extraer token desde Host;
+    :Consultar estado del token;
+  else (No)
+    :Obtener IP de origen;
+    :Consultar estado asociado a IP;
+  endif
+  :Aplicar motor DNS;
+}
+stop
+@enduml
