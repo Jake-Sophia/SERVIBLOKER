@@ -1,0 +1,84 @@
+@startuml
+title SERVIBLOKER - 06 - API v1 y permisos
+skinparam shadowing false
+start
+partition "AUTENTICACIÓN" {
+  :Servidor cliente llama a /api/v1;
+  :Leer cabecera X-API-Key;
+  if (¿Falta la cabecera?) then (Sí)
+    :HTTP 401 falta_api_key;
+    stop
+  endif
+  :Calcular SHA256 de clave;
+  :Leer api_keys.json;
+  :Comparar hashes con compare_digest;
+  if (¿No encontrada o revocada?) then (Sí)
+    :HTTP 403 api_key_invalida;
+    stop
+  endif
+  :Verificar scope o permiso *;
+  if (¿Permiso insuficiente?) then (Sí)
+    :HTTP 403 api_key_invalida;
+    stop
+  endif
+  :Incrementar uses y last_used_at;
+  :Persistir api_keys.json;
+}
+if (¿Endpoint?) then (POST /api/v1/activar)
+  :Leer codigo, horas, licencia e IP opcional;
+  if (¿Código vacío u horas inválidas?) then (Sí)
+    :HTTP 400;
+    stop
+  endif
+  if (¿Licencia opcional proporcionada?) then (Sí)
+    :Licenses.check;
+    if (¿Inválida?) then (Sí)
+      :HTTP 403;
+      stop
+    endif
+  endif
+  :Llamar _activar con origen api e IP forzada;
+  :Buscar token o IP en registro o solicitud;
+  if (¿Ninguna identidad?) then (Sí)
+    :HTTP 404;
+    stop
+  endif
+  if (¿Token válido?) then (Sí)
+    :Store.unlock(token);
+  endif
+  if (¿IP disponible?) then (Sí)
+    :Store.unlock_ip(IP);
+  endif
+  if (¿Registro Codes existe?) then (Sí)
+    :Codes.activate;
+  else (No)
+    :Store.deny;
+  endif
+  :Sincronizar firewall si hay scripts;
+  :Responder unlocked_until y api_key id;
+elseif (¿Endpoint?) then (GET /api/v1/estado/{codigo})
+  :Codes.get;
+  if (¿No existe?) then (Sí)
+    :HTTP 404;
+    stop
+  endif
+  :Responder estado del código;
+else (POST /api/v1/revocar)
+  :Leer código y horas;
+  if (¿Código vacío o inexistente?) then (Sí)
+    :HTTP 400 o 404;
+    stop
+  endif
+  :Codes.revoke;
+  :Leer IP del código;
+  if (¿IP presente y horas >= 0?) then (Sí)
+    :Store.set_ip_unlocked_until(IP, 0);
+  endif
+  note right
+    La ruta no modifica directamente
+    el vencimiento del token individual.
+  end note
+  :Responder ok;
+endif
+stop
+@enduml
