@@ -1,0 +1,94 @@
+@startuml
+title SERVIBLOKER - 07 - Persistencia y mantenimiento
+skinparam shadowing false
+start
+:Seleccionar operación;
+if (¿Origen?) then (CLI)
+  :ArgumentParser y Config.load;
+  if (¿Comando?) then (device)
+    if (¿Subcomando?) then (add)
+      :Generar token único;
+      :Guardar dispositivo nuevo en devices.json;
+    elseif (¿Subcomando?) then (list)
+      :Listar equipos y calcular tiempo restante;
+    elseif (¿Subcomando?) then (unlock)
+      :Validar token y aplicar Store.unlock;
+    elseif (¿Subcomando?) then (lock)
+      :Store.set_unlocked_until(token,0);
+    elseif (¿Subcomando?) then (delete)
+      :Store.delete(token);
+    else (caddy)
+      :Regenerar bloques Caddy por token;
+    endif
+  elseif (¿Comando?) then (profile)
+    :Verificar token;
+    :Generar .mobileconfig;
+    :Escribir archivo o stdout;
+  elseif (¿Comando?) then (decide)
+    :Evaluar dominios en strict y unlocked;
+    :Imprimir regla y decisión;
+  elseif (¿Comando?) then (log)
+    :Leer últimas N líneas de blocked.log;
+    :Mostrar entradas JSON válidas;
+  elseif (¿Comando?) then (apikey)
+    :Crear, listar o revocar claves;
+  else (serve)
+    :Arrancar servidores;
+  endif
+elseif (¿Origen?) then (GET /salud)
+  :Calcular uptime, equipos, licencias y pendientes;
+  :Consultar contadores de Filter;
+  :Añadir hits, misses y tamaño de caché;
+  :Devolver JSON;
+else (Módulos de datos)
+  :Store / Codes / ApiKeys / Licenses;
+endif
+partition "ALMACENAMIENTO" {
+  if (¿Escritura?) then (Sí)
+    :Adquirir candado RLock;
+    :Actualizar estructura en memoria;
+    :Escribir archivo temporal .tmp;
+    :Serializar JSON;
+    :flush + fsync;
+    :os.replace atómico;
+    :Aplicar chmod 0600;
+    :Actualizar mtime;
+    :Liberar candado;
+  else (Lectura)
+    :Consultar mtime;
+    if (¿Archivo modificado?) then (Sí)
+      :Releer archivo JSON;
+      if (¿JSON válido?) then (Sí)
+        :Actualizar datos en memoria;
+      else (No)
+        :Conservar información previa;
+      endif
+    endif
+  endif
+}
+partition "REGISTRO DNS" {
+  if (¿Evento bloqueado o error?) then (Sí)
+    :Registrar timestamp, kind, device, mode, QNAME y motivo;
+    :Agregar a deque reciente;
+    if (¿Archivo excede límite?) then (Sí)
+      :Rotar blocked.log a blocked.log.1;
+    endif
+    :Añadir línea JSON a blocked.log;
+  endif
+}
+partition "MANTENIMIENTO" {
+  if (¿Sincronizar licencias?) then (Sí)
+    :sync-licencias.sh;
+    :Validar archivo de origen;
+    :Copiar al VPS por SCP;
+    :Mover archivo temporal al definitivo;
+    :Actualizar propietario;
+    :Licenses recarga al detectar mtime;
+  endif
+  if (¿Ejecutar pruebas?) then (Sí)
+    :tests/test_blockservi.py o tests/smoke.py;
+    :Validar reglas, datos, perfiles, API y DNS;
+  endif
+}
+stop
+@enduml
