@@ -1,0 +1,36 @@
+@startuml
+title SERVIBLOKER - 04B - Solicitudes pendientes
+start
+:GET /api/pedido o /api/pedido/{token};
+:Leer parámetro nuevo;
+if (¿Hay token?) then (Sí)
+  :Buscar equipo por token;
+  if (¿nuevo está presente?) then (Sí)
+    :Store.request(token);
+    :Reutilizar código vigente o generar otro;
+  endif
+  :Store.request_info(token);
+else (No)
+  :Obtener IP de origen;
+  if (¿No se pudo obtener IP?) then (Sí)
+    :HTTP 400 sin_identificar;
+    stop
+  endif
+  :Store.request_ip(IP, nuevo);
+  if (¿Código vigente y nuevo=false?) then (Sí)
+    :Reutilizar código;
+  else (No)
+    :Generar solicitud de seis dígitos;
+    :Guardar request_code y requested_at;
+  endif
+  :Store.request_info_ip(IP);
+endif
+:Retornar estado JSON;
+note right
+  Las solicitudes de Store aparecen
+  en pending_requests().
+  Esta ruta es independiente de
+  /api/register del JavaScript principal.
+end note
+stop
+@enduml
