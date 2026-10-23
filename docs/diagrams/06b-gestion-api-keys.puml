@@ -1,0 +1,33 @@
+@startuml
+title SERVIBLOKER - 06B - Gestión de API Keys
+start
+:CLI blockservi apikey;
+if (¿Acción?) then (create)
+  :Leer scope y nota;
+  if (¿Scope válido?) then (No)
+    :Mostrar error;
+    stop
+  endif
+  :Generar bsk_live_ + token aleatorio;
+  :Crear ID hexadecimal;
+  :Calcular SHA256;
+  :Guardar hash, scope, nota, created_at y uses=0;
+  :Escribir api_keys.json;
+  :Mostrar clave completa una sola vez;
+elseif (¿Acción?) then (list)
+  :Leer api_keys.json;
+  :Ordenar por fecha;
+  :Mostrar ID, scope, usos, último uso y revocación;
+else (revoke)
+  :Leer ID de clave;
+  :Buscar entrada;
+  if (¿Existe?) then (Sí)
+    :revocado=true;
+    :Guardar revoked_at;
+    :Escribir api_keys.json;
+  else (No)
+    :Mostrar error;
+  endif
+endif
+stop
+@enduml
