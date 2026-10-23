@@ -1,0 +1,98 @@
+@startuml
+title SERVIBLOKER - 04 - Portal y códigos del iPhone
+skinparam shadowing false
+skinparam activityBackgroundColor #EAF4FF
+skinparam activityBorderColor #41638C
+start
+partition "ENTRADA AL PORTAL" {
+  :iPhone abre /, /activar, /codes.html o /activar/{token};
+  if (¿Token en URL o Host?) then (Sí)
+    :Store.request_info(token);
+    if (¿Equipo desconocido?) then (Sí)
+      :Mostrar advertencia de equipo no registrado;
+    endif
+  else (No)
+    :Obtener IP del visitante;
+    if (¿GET / y captive_ip vacío?) then (Sí)
+      :Redirigir a /activar;
+    endif
+    :Store.token_by_ip(IP);
+    if (¿Token previamente visto?) then (Sí)
+      :Renderizar página del token;
+    elseif (¿trust_ip habilitado?) then (Sí)
+      :Store.request_info_ip(IP);
+      :Renderizar página de IP;
+    else (No)
+      :Mostrar formulario de referencia manual;
+    endif
+  endif
+  :Generar HTML device_page();
+  :Mostrar código, estado y formulario de canje;
+}
+partition "CÓDIGO GENERADO POR EL NAVEGADOR" {
+  if (¿Hay código previo de Store?) then (Sí)
+    :Mostrar código existente;
+  else (No)
+    :Generar seis dígitos con Math.random;
+    :POST /api/register con code y token opcional;
+    if (¿Formato distinto de seis dígitos?) then (Sí)
+      :HTTP 400;
+      stop
+    endif
+    if (¿Token desconocido?) then (Sí)
+      :HTTP 404;
+      stop
+    endif
+    :Codes.register(code, token, IP);
+    :Crear entrada pendiente si no existe;
+    :Guardar codes.json;
+  endif
+  while (¿Página abierta y no está activo?) is (Sí)
+    :Cada 5 segundos consultar /api/estado-codigo/{codigo};
+    :Codes.get(codigo);
+    if (¿Código activo y no vencido?) then (Sí)
+      :Mostrar ACTIVADO;
+      :Detener sondeo y deshabilitar generación;
+      break
+    else (No)
+      :Mostrar PENDIENTE;
+    endif
+  endwhile (No)
+  if (¿Pulsa generar otro?) then (Sí)
+    :Generar y registrar código nuevo;
+    note right
+      El registro anterior en Codes
+      no se revoca automáticamente.
+    end note
+  endif
+}
+partition "CANJE DE CÓDIGO PREGENERADO" {
+  if (¿Usuario introduce código del administrador?) then (Sí)
+    :Quitar caracteres no numéricos;
+    if (¿No tiene seis dígitos?) then (Sí)
+      :Mostrar error en formulario;
+      stop
+    endif
+    :POST /api/canjear;
+    :Validar código, token e IP;
+    if (¿Identidad no válida?) then (Sí)
+      :HTTP 400 o 404;
+      stop
+    endif
+    :Codes.redeem(codigo, token, IP);
+    if (¿No es código panel disponible y vigente?) then (Sí)
+      :HTTP 403 codigo_no_valido;
+      stop
+    endif
+    :Marcar usado_at de forma atómica;
+    if (¿Token presente?) then (Sí)
+      :Store.unlock(token, horas);
+    else (No)
+      :Store.unlock_ip(IP, horas);
+    endif
+    :Codes.activate(codigo, horas, canje);
+    :Responder unlocked_until y recargar página;
+  endif
+}
+stop
+@enduml
