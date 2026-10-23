@@ -1,0 +1,269 @@
+@startuml
+title SERVIBLOKER - 03 - Motor DNS completo
+skinparam shadowing false
+skinparam activity {
+ BackgroundColor #E7F2FF
+ BorderColor #315F8C
+ DiamondBackgroundColor #FFEFC9
+ DiamondBorderColor #B3842B
+}
+skinparam ArrowColor #315F8C
+
+start
+partition "CLIENTE / TRANSPORTE" {
+  :Una aplicación necesita resolver dominio;
+  if (¿Transporte?) then (DoH HTTPS)
+    :Enviar /dns-query;
+    if (¿GET?) then (Sí)
+      :Leer parámetro dns;
+      :Decodificar base64url;
+      if (¿Base64 inválido?) then (Sí)
+        :HTTP 400;
+        stop
+      endif
+    elseif (¿POST?) then (Sí)
+      :Leer cuerpo DNS binario;
+    else (Método no permitido)
+      :HTTP 405;
+      stop
+    endif
+    if (¿Consulta vacía?) then (Sí)
+      :HTTP 400;
+      stop
+    endif
+    :Obtener Host y dirección IP;
+    :Extraer token desde Host si existe;
+  else (DNS UDP/TCP)
+    :PlainBridge recibe solicitud;
+    :Leer IP de origen;
+    :Buscar token en device_map;
+    :Convertir consulta a wire;
+    note right
+      El mapa se inicializa vacío
+      en el arranque actual.
+    end note
+  endif
+}
+
+partition "VALIDACIÓN DNS" {
+  :DNSRecord.parse(wire);
+  if (¿DNS ilegible?) then (Sí)
+    :Devolver respuesta nula;
+    :DoH devuelve HTTP 400;
+    :PlainBridge devuelve SERVFAIL;
+    stop
+  endif
+  if (¿Paquete es respuesta QR=1?) then (Sí)
+    :Descartar paquete;
+    stop
+  endif
+  if (¿Sin preguntas o múltiples preguntas?) then (Sí)
+    :Responder FORMERR;
+    stop
+  endif
+  :Leer QNAME y QTYPE;
+  :Normalizar nombre a minúsculas;
+  if (¿QTYPE no soportado?) then (Sí)
+    :Registrar tipo no admitido;
+    :Responder bloqueo DNS configurado;
+    stop
+  endif
+}
+
+partition "IDENTIFICACIÓN Y ESTADO" {
+  if (¿Se proporcionó token?) then (Sí)
+    :Store.note_ip(token, IP);
+    :Buscar dispositivo;
+    if (¿Token conocido y ventana vigente?) then (Sí)
+      :Modo = unlocked;
+    else (No)
+      :Modo = strict;
+    endif
+  else (No)
+    :Buscar entrada de IP en Store;
+    if (¿IP autorizada y no vencida?) then (Sí)
+      :Modo = unlocked;
+    else (No)
+      :Modo = strict;
+    endif
+    :Actualizar última actividad IP si existe;
+  endif
+}
+
+partition "CONTROL DE TIPOS DNS" {
+  :Policy.check_qtype(QTYPE);
+  if (¿QTYPE está en blocked_qtypes?) then (Sí)
+    :Contador blocked++;
+    :Registrar consulta bloqueada;
+    if (¿QTYPE es AAAA?) then (Sí)
+      :Devolver NOERROR sin registros IPv6;
+    else (No)
+      :Construir respuesta de bloqueo;
+      :NXDOMAIN con SOA o REFUSED;
+    endif
+    stop
+  endif
+}
+
+partition "MOTOR DE POLÍTICAS" {
+  :Policy.decide(nombre, modo);
+  if (¿Nombre vacío?) then (Sí)
+    :Decisión = DENY;
+    :Motivo = nombre vacío;
+  else (No)
+    if (¿Coincide deny_always?) then (Sí)
+      :Decisión = DENY PERMANENTE;
+      :Motivo = bloqueo permanente;
+    else (No)
+      if (¿Modo unlocked?) then (Sí)
+        :Decisión = ALLOW;
+        :Motivo = acceso habilitado por código;
+      else (No)
+        if (¿Coincide deny_strict?) then (Sí)
+          :Decisión = DENY;
+          :Motivo = bloqueo sin código;
+        else (No)
+          if (¿Coincide allow_strict?) then (Sí)
+            :Decisión = ALLOW;
+            :Motivo = permitido siempre;
+          else (No)
+            if (¿strict_push y coincide allow_strict_optional?) then (Sí)
+              :Decisión = ALLOW;
+              :Motivo = permitido opcional;
+            else (No)
+              :Decisión = DENY;
+              :Motivo = fuera de lista blanca;
+            endif
+          endif
+        endif
+      endif
+    endif
+  endif
+}
+
+if (¿Decisión ALLOW?) then (No)
+  partition "RESPUESTA BLOQUEADA" {
+    :Contador blocked++;
+    :Registrar nombre, tipo, modo y motivo;
+    if (¿Bloqueo no permanente?) then (Sí)
+      if (¿Hay captive_ip y QTYPE es A?) then (Sí)
+        :Construir respuesta NOERROR;
+        :Devolver registro A = IP del VPS;
+        :TTL = 60 segundos;
+      elseif (¿Hay captive_ip y QTYPE es AAAA?) then (Sí)
+        :Construir NOERROR sin IPv6;
+      else (No)
+        :Devolver NXDOMAIN o REFUSED;
+      endif
+    else (Permanente)
+      :Devolver NXDOMAIN o REFUSED;
+      note right
+        No se redirige al portal.
+        Un código no elimina
+        el bloqueo permanente.
+      end note
+    endif
+  }
+  stop
+endif
+
+partition "RESOLUCIÓN AUTORIZADA" {
+  :Contador allowed++;
+  :Actualizar actividad de dispositivo;
+  :Llamar Upstream.resolve(wire);
+  :Construir clave caché;
+  :QNAME + QTYPE + bandera RD;
+  if (¿Entrada de caché existe?) then (Sí)
+    if (¿TTL vigente?) then (Sí)
+      :Incrementar cache hits;
+      :Leer respuesta almacenada;
+      :Reescribir DNS Transaction ID;
+      :Devolver respuesta DNS;
+      stop
+    else (No)
+      :Eliminar entrada caducada;
+    endif
+  endif
+  :Incrementar cache misses;
+  if (¿Ya existe consulta inflight igual?) then (Sí)
+    :Esperar Future existente con shield;
+    :Reutilizar respuesta;
+    :Reescribir Transaction ID;
+    :Devolver respuesta DNS;
+    stop
+  endif
+  :Crear Future para consulta;
+  :Registrar inflight[key];
+}
+
+partition "CONSULTA UPSTREAM" {
+  :Reunir endpoints DoH y UDP;
+  if (¿No hay resolventes?) then (Sí)
+    :Lanzar UpstreamError;
+  else (No)
+    :Mezclar aleatoriamente el orden;
+    while (¿Quedan servidores y no hay éxito?) is (Sí)
+      :Seleccionar endpoint;
+      if (¿Endpoint HTTP?) then (Sí)
+        :Enviar POST DNS wire por HTTPS;
+        :Content-Type application/dns-message;
+        :Aplicar timeout configurado;
+        if (¿HTTP 200 y respuesta coincidente?) then (Sí)
+          :Aceptar payload;
+          :Marcar éxito;
+        else (No)
+          :Registrar fallo y probar siguiente;
+        endif
+      else (UDP)
+        :Enviar paquete DNS UDP al puerto 53;
+        :Esperar respuesta con timeout;
+        if (¿Respuesta DNS QR válida?) then (Sí)
+          :Normalizar Transaction ID;
+          :Aceptar payload;
+          :Marcar éxito;
+        else (No)
+          :Registrar fallo y probar siguiente;
+        endif
+      endif
+    endwhile (No)
+    if (¿Todos los servidores fallaron?) then (Sí)
+      :Lanzar UpstreamError con errores;
+    endif
+  endif
+}
+
+if (¿Upstream terminó correctamente?) then (Sí)
+  partition "CACHÉ Y RESPUESTA" {
+    :Retirar inflight[key];
+    :Resolver Future compartido;
+    :Comprobar RCODE de respuesta;
+    if (¿RCODE NOERROR o NXDOMAIN?) then (Sí)
+      :Calcular TTL;
+      if (¿Hay respuestas DNS con TTL positivo?) then (Sí)
+        :Utilizar TTL mínimo positivo;
+      else (No)
+        :Usar SOA o TTL de respaldo;
+      endif
+      if (¿Caché excede límite?) then (Sí)
+        :Depurar entradas vencidas;
+        if (¿Todavía excede límite?) then (Sí)
+          :Vaciar caché;
+        endif
+      endif
+      :Guardar respuesta con caducidad;
+    endif
+    :Reescribir Transaction ID original;
+    :Devolver DNS wire al cliente;
+  }
+else (No)
+  partition "ERROR DE RESOLUCIÓN" {
+    :Retirar inflight[key];
+    :Propagar excepción de resolución;
+    :Contador error++;
+    :Registrar causa upstream;
+    :Construir SERVFAIL;
+    :Entregar error al cliente;
+  }
+endif
+stop
+@enduml
