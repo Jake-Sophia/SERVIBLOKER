@@ -1,0 +1,97 @@
+@startuml
+title SERVIBLOKER - 05 - Panel administrativo
+skinparam shadowing false
+start
+partition "AUTENTICACIÓN" {
+  :Recibir solicitud del administrador;
+  :Leer ?k= o X-Admin-Key;
+  :Comparar con admin_key mediante compare_digest;
+  if (¿Autorización correcta?) then (No)
+    :HTTP 401;
+    stop
+  endif
+}
+if (¿Operación?) then (GET /panel)
+  :Leer Store.pending_requests;
+  :Leer Store.list e ip_list;
+  :Leer Licenses.inventory;
+  :Leer Codes.list;
+  :Renderizar admin_page;
+  :Mostrar solicitudes, accesos, códigos y equipos;
+elseif (¿Operación?) then (Generar)
+  :POST /api/admin/generar;
+  :Leer horas, días, cantidad;
+  :Limitar cantidad a 1..50;
+  repeat
+    :Codes.generate;
+    :Generar seis dígitos únicos;
+    :Guardar origen panel, expiración y horas;
+  repeat while (¿Quedan códigos?) is (Sí)
+  :Devolver lista generada;
+elseif (¿Operación?) then (Aprobar)
+  :POST /api/admin/ok;
+  :Validar código y licencia opcional;
+  if (¿Código vacío o licencia inválida?) then (Sí)
+    :Responder HTTP 400 o 403;
+    stop
+  endif
+  :Ejecutar _activar;
+  :Buscar token en Codes o solicitudes Store;
+  :Buscar IP en Codes o solicitudes Store;
+  if (¿No hay token ni IP?) then (Sí)
+    :HTTP 404;
+    stop
+  endif
+  if (¿Token válido?) then (Sí)
+    :Store.unlock(token, licencia, horas);
+  endif
+  if (¿IP disponible?) then (Sí)
+    :Store.unlock_ip(IP, licencia, horas);
+  endif
+  if (¿Código registrado en Codes?) then (Sí)
+    :Codes.activate;
+  else (No)
+    :Store.deny para limpiar solicitud pendiente;
+  endif
+  :Ejecutar scripts de sincronización de firewall si existen;
+  :Devolver identidades abiertas y vencimiento;
+elseif (¿Operación?) then (Rechazar)
+  :POST /api/admin/no;
+  :Store.deny(codigo);
+  if (¿Solicitud no encontrada?) then (Sí)
+    :HTTP 404;
+  else (No)
+    :Limpiar request_code y requested_at;
+  endif
+elseif (¿Operación?) then (Revocar código)
+  :POST /api/admin/revocar;
+  :Codes.revoke(codigo);
+  note right
+    No borra por sí solo
+    unlocked_until del dispositivo.
+  end note
+elseif (¿Operación?) then (Bloquear token)
+  :POST /api/bloquear/{token};
+  :Store.set_unlocked_until(token, 0);
+elseif (¿Operación?) then (Revocar IP)
+  :POST /api/admin/ip/{ip};
+  :Store.set_ip_unlocked_until(IP, 0);
+elseif (¿Operación?) then (Desbloqueo directo)
+  :POST /api/desbloquear;
+  :Verificar token y licencia obligatoria;
+  if (¿Inválido?) then (Sí)
+    :Responder error;
+    stop
+  endif
+  :Store.unlock(token, code, hours);
+else (Consultas)
+  if (¿GET /api/list?) then (Sí)
+    :Codes.list;
+  else (No)
+    :GET /api/estado/{token};
+    :Consultar modo, etiqueta y vencimiento;
+  endif
+endif
+:Responder y persistir cambios aplicables;
+stop
+@enduml
