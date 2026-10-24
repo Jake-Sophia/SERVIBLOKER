@@ -227,25 +227,19 @@ const el=document.createElement("span");el.className="slot";el.textContent=ch;sl
     let statusTimer=null;
     function checkStatus(){{
       var code=codeEl.value;if(!code)return;
-      fetch("/api/estado-codigo/"+code,{{cache:"no-store"}}).then(function(r){{return r.json()}})
+      fetch("/api/estado-codigo/"+code,{{cache:"no-store",headers:{{"X-Device-Token":equipo}}}}).then(function(r){{return r.json()}})
         .then(function(d){{
           if(d&&d.error)return;
           setStatus(d.active?"active":"pending");
-          if(d.active){{
-            if(statusTimer)clearInterval(statusTimer);
-            document.getElementById("btn-generate").disabled=true;
-          }}
+          document.getElementById("btn-generate").disabled=Boolean(d.active);
         }}).catch(function(){{}});
     }}
     function gen(){{
-      const code=String(Math.floor(100000+Math.random()*900000));
-      codeEl.value=code;display(code);setStatus("pendiente");
-      const cuerpo={{code:code}};
-      if(equipo)cuerpo.token=equipo;
-      fetch("/api/register",{{method:"POST",headers:{{"Content-Type":"application/json"}},
-        body:JSON.stringify(cuerpo)}}).then(function(r){{return r.json()}})
-        .then(function(d){{if(d.error)console.error("Register error:",d.error);}});
-      setTimeout(checkStatus,800);
+      fetch("/api/pedido/"+encodeURIComponent(equipo)+"?nuevo=1",{{cache:"no-store"}})
+        .then(function(r){{return r.json()}}).then(function(d){{
+          if(d.error){{estadoEl.textContent="No se pudo solicitar el codigo";return;}}
+          codeEl.value=d.codigo;display(d.codigo);checkStatus();
+        }}).catch(function(){{estadoEl.textContent="Sin conexion al servidor";}});
     }}
     document.getElementById("btn-generate").addEventListener("click",gen);
     const previo={_escape(code)!r};
@@ -283,9 +277,8 @@ def admin_page(
 ) -> str:
     """Panel del administrador: autorizar, rechazar y revisar el estado.
 
-    `key` es la clave de administracion que se ha usado para abrir la pagina.
-    Se incrusta en el JavaScript porque, al venir en la query, el navegador no la
-    manda sola en las llamadas a la API.
+    El parámetro key se conserva por compatibilidad de llamada; no se inserta
+    ningún secreto administrativo en el HTML.
     """
     if requests:
         rows = ""
@@ -312,7 +305,7 @@ def admin_page(
         drows = ""
         for device in devices:
             until = int(device.get("unlocked_until") or 0)
-            if until > 0:
+            if until > int(time.time()):
                 state = f'<span class="pill on">AUTORIZADO {_left(until)}</span>'
             else:
                 state = '<span class="pill">RESTRINGIDO</span>'
@@ -446,8 +439,8 @@ def admin_page(
 </div>
 <div class="nuevos" id="nuevos"></div>
 <p class="fineprint">Cada codigo abre la salida del telefono durante las horas que elijas.
-Siguen vetados siempre Libros, iTunes y Find My iPhone. Antes de canjear, el
-telefono solo tiene YouTube, Telegram y esta pagina.</p>
+Se aplican las reglas administrativas configuradas. La disponibilidad de servicios
+depende de DNS y del estado efectivo del túnel. Se conservan las protecciones de Apple.</p>
 </div>
 <div class="activation"><div class="eyebrow">SOLICITUDES PENDIENTES</div>{table}</div>
 <div class="hours"><label>HORAS</label><input id="hours" type="number" min="1" max="720" value="{hours}">
@@ -459,9 +452,14 @@ telefono solo tiene YouTube, Telegram y esta pagina.</p>
 <div class="footer">&#8226; blockservi &#183; Panel local</div>
 </section></main>
 <script>
-var clave={_escape(key)!r};
-function api(ruta){{
-  return ruta+(ruta.indexOf("?")>=0?"&":"?")+"k="+encodeURIComponent(clave);}}
+const originalFetch=window.fetch.bind(window);
+window.fetch=function(url,options={{}}){{
+ const target=new URL(url,location.href);
+ if(target.origin===location.origin){{options.headers=new Headers(options.headers||{{}});
+ options.headers.set("X-IBLOKER-Request","1");options.credentials="same-origin";}}
+ return originalFetch(url,options);
+}};
+function api(ruta){{return ruta;}}
 function valor(id){{return document.getElementById(id).value;}}
 document.getElementById("generar").addEventListener("click",function(){{
 var boton=this;boton.disabled=true;boton.textContent="Generando...";
@@ -511,7 +509,7 @@ def manual_page(ip: str = "") -> str:
 <span><span class="icon">&#9647;</span>Direccion IP</span><b>{_escape(ip or "-")}</b></div></div>
 <form method="get" action="/activar"><div class="actions">
 <label for="t" class="sr-only">Referencia del equipo</label>
-<input id="t" name="t" maxlength="32" autocapitalize="none" autocomplete="off" required
+<input id="t" name="t" maxlength="48" autocapitalize="none" autocomplete="off" required
 style="width:100%;padding:13px;border:1px solid rgba(93,235,226,.35);border-radius:13px;
 background:rgba(4,12,24,.7);color:#eafffd;font:inherit;letter-spacing:1px;margin-top:8px"
 placeholder="dev-3ce1abaac4f1">
@@ -537,3 +535,63 @@ def _ago(when: int) -> str:
     if seconds < 86400:
         return f"{seconds // 3600} h"
     return f"{seconds // 86400} d"
+
+
+def login_page() -> str:
+    return """<!doctype html><html lang="es"><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>IBLOKER · Acceso</title><style>body{font:18px system-ui;background:#101827;color:white;
+max-width:26rem;margin:10vh auto;padding:1rem}input,button{box-sizing:border-box;width:100%;
+padding:1rem;margin-top:1rem;font:inherit;border-radius:.5rem}</style>
+<h1>IBLOKER</h1><form id="login"><label>Clave administrativa
+<input id="key" type="password" autocomplete="current-password" required></label>
+<button>Entrar al panel</button><p id="error" role="alert"></p></form>
+<script>document.getElementById('login').onsubmit=async function(e){e.preventDefault();
+const r=await fetch('/login',{method:'POST',headers:{'Content-Type':'application/json',
+'X-IBLOKER-Request':'1'},body:JSON.stringify({key:document.getElementById('key').value})});
+document.getElementById('key').value='';
+if(r.ok)location.assign('/panel');else document.getElementById('error').textContent='Acceso rechazado';};
+</script></html>"""
+
+
+def virtual_panel() -> str:
+    return """<section class="card" style="margin-top:1rem;overflow:auto">
+<h2>IBLOKER VIRTUAL</h2><p>Un perfil exclusivo por iPhone. Descárgalo y compártelo por AirDrop.</p>
+<label>Nombre del equipo <input id="virtual-label" maxlength="80"></label>
+<button class="mini" id="virtual-create">Generar perfil individual</button>
+<button class="mini" id="logout">Cerrar sesión</button>
+<p id="virtual-status" role="status"></p><div id="virtual-devices"></div>
+<details><summary>Actividad DNS y errores recientes</summary><pre id="virtual-log"></pre></details>
+<script>
+function vtext(parent,tag,text){const el=document.createElement(tag);el.textContent=text;parent.append(el);return el;}
+async function vrefresh(){try{
+const r=await fetch('/api/virtual/devices');if(!r.ok)throw Error('No autorizado');const d=await r.json();
+document.getElementById('virtual-status').textContent=d.vpn_enabled?
+ 'Controlador: '+(d.controller.healthy&&d.controller.fresh?'operativo':'sin verificar')+' · '+(d.controller.error||''):
+ 'Modo DNS. VPN deshabilitada; no se controla tráfico IP.';
+const parent=document.getElementById('virtual-devices');parent.replaceChildren();
+for(const device of d.devices){const row=vtext(parent,'article','');row.style.cssText='border-top:1px solid #456;padding:1rem 0;overflow-wrap:anywhere';
+vtext(row,'h3',device.label||'iPhone');vtext(row,'p','Identidad: '+device.token+' · '+device.state);
+vtext(row,'p','DNS: '+device.dns+' · VPN: '+device.vpn+' · IP pública: '+(device.public_ip||'sin contacto'));
+vtext(row,'p','Último contacto: '+(device.last_contact?new Date(device.last_contact*1000).toLocaleString():'nunca')+
+ ' · Autorización: '+(device.unlocked_until?new Date(device.unlocked_until*1000).toLocaleString():'sin autorización'));
+vtext(row,'p','Sesiones: '+new Set(device.sessions.map(s=>s.ike_id)).size+' · IP interna: '+[...new Set(device.sessions.flatMap(s=>s.virtual_ips))].join(', '));
+vtext(row,'p','Certificado vence: '+(device.credential_expires_at?new Date(device.credential_expires_at*1000).toLocaleString():'no emitido / no aplica'));
+const activation=vtext(row,'a','Portal del equipo');activation.href=device.activation_url;
+if(device.profile_ready&&device.state!=='REVOKED'){const link=vtext(row,'a',' · Descargar .mobileconfig');link.href='/perfil/'+device.token+'.mobileconfig';}
+else vtext(row,'p',device.state==='REVOKED'?'Credencial revocada':device.credential_expires_at?'Certificado vencido; generar una identidad nueva':'Certificado pendiente del controlador');
+for(const [action,label] of [['unlock','Autorizar horas'],['lock','Revocar autorización'],['revoke','Revocar credencial']]){
+ const button=vtext(row,'button',label);button.className='mini';button.onclick=async()=>{
+ const hours=action==='unlock'?Number(prompt('Horas (1–2160)','24')):0;
+ if(action==='unlock'&&(!Number.isInteger(hours)||hours<1||hours>2160))return;
+ const result=await fetch('/api/virtual/devices/'+device.token+'/'+action,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({hours})});
+ if(!result.ok){document.getElementById('virtual-status').textContent='Operación rechazada: '+await result.text();return;}await vrefresh();};}
+}
+}catch(error){document.getElementById('virtual-status').textContent=error.message;}}
+document.getElementById('virtual-create').onclick=async()=>{
+const result=await fetch('/api/virtual/devices',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label:document.getElementById('virtual-label').value})});
+if(!result.ok){document.getElementById('virtual-status').textContent='No se pudo crear';return;}await vrefresh();};
+document.getElementById('logout').onclick=async()=>{await fetch('/logout',{method:'POST'});location.assign('/login');};
+async function vlogs(){const r=await fetch('/api/virtual/activity');if(r.ok)document.getElementById('virtual-log').textContent=JSON.stringify(await r.json(),null,2);}
+window.addEventListener('DOMContentLoaded',()=>{vrefresh();vlogs();setInterval(vrefresh,5000);setInterval(vlogs,15000);});
+</script></section>"""

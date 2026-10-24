@@ -38,7 +38,17 @@ class PlainBridge:
         client = getattr(handler, "client_address", None)
         if not client:
             return None
-        return self.device_map.get(str(client[0]))
+        token = self.device_map.get(str(client[0]))
+        if token:
+            return token
+        virtual = getattr(self.filter, "virtual", None)
+        if virtual:
+            observed = virtual.observed()
+            if observed.get("fresh") and observed.get("healthy"):
+                for session in observed.get("sessions", []):
+                    if str(client[0]) in session.get("virtual_ips", []):
+                        return session["token"]
+        return None
 
     def client_ip(self, handler: Any) -> str:
         client = getattr(handler, "client_address", None)

@@ -1,0 +1,22 @@
+@startuml
+title IBLOKER VIRTUAL y estado observado
+actor Administrador
+participant "/login y /panel" as W
+database Store as S
+database VirtualState as V
+participant "Controlador root" as C
+Administrador -> W: login HTTPS (clave en cuerpo JSON)
+W --> Administrador: cookie Secure/HttpOnly/SameSite, 8 horas
+loop sondeo 5 s
+Administrador -> W: GET /api/virtual/devices
+W -> S: estado deseado / último DNS / vencimiento
+W -> V: sesiones y salud VICI/firewall
+W --> Administrador: ready/pending, DNS, VPN, IP interna/pública
+end
+Administrador -> W: unlock/lock/revoke (cabecera CSRF)
+W -> S: actualizar estado persistente
+W --> Administrador: pending_reconciliation
+C -> S: siguiente ciclo
+C -> V: estado observado tras nft exitoso
+note over W,C: No se anuncia éxito nft sólo por pulsar un botón.
+@enduml

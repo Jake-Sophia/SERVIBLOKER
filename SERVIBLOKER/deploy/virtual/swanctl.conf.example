@@ -1,0 +1,36 @@
+# /etc/swanctl/conf.d/iblocker.conf. Sustituir vpn.example.com.
+connections {
+  iblocker {
+    version = 2
+    local_addrs = %any
+    pools = iblocker4, iblocker6
+    unique = replace
+    mobike = yes
+    fragmentation = yes
+    dpd_delay = 30s
+    reauth_time = 1h
+    local {
+      auth = pubkey
+      id = vpn.example.com
+      certs = iblocker-server.pem
+    }
+    remote {
+      auth = pubkey
+      cacerts = iblocker-ca.pem
+      revocation = strict
+    }
+    children {
+      internet {
+        local_ts = 0.0.0.0/0, ::/0
+        remote_ts = dynamic
+        dpd_action = clear
+        start_action = none
+        rekey_time = 30m
+      }
+    }
+  }
+}
+pools {
+  iblocker4 { addrs = 10.77.0.0/24 }
+  iblocker6 { addrs = fd77:77::/120 }
+}

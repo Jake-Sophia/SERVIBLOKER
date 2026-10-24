@@ -1,0 +1,21 @@
+@startuml
+title Restricción, expiración y revocación
+participant "Panel / API / CLI" as A
+database Store as S
+participant "Controlador root" as C
+participant strongSwan as V
+database nftables as N
+A -> S: unlock(hours) / UNLOCKED
+C -> S: leer effective_until / licencia
+C -> N: set unlocked timeout min(15s, vencimiento)
+alt expira autorización o licencia
+S -> S: EXPIRED efectivo
+C -> N: no renovar / retirar permiso
+note right of N: Revalidar ambos sentidos antes de conntrack.
+Si C se cae, timeout cierra en <=15 s.
+else revocar credencial
+A -> S: credential_revoked_at / REVOKED
+C -> V: cargar CRL, terminar SA correspondiente
+C -> N: retirar identidad de reglas
+end
+@enduml

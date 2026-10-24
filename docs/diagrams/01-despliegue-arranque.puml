@@ -1,0 +1,18 @@
+@startuml
+title Arranque real: guardia anterior al VPN
+actor Operador
+participant "iblocker-guard.service" as G
+participant "strongswan.service" as S
+participant "blockservi.service" as B
+participant "iblocker-controller.service" as C
+database "nft inet iblocker" as N
+Operador -> G: habilitar tras revisión Linux
+G -> N: render_rules(sesiones=[]) / nft --check / aplicar
+G --> S: Requires/After satisfechos
+S -> S: cargar conexión pubkey revisada
+B -> B: Policy + Store + Codes + Licenses + API + DoH
+C -> S: observar VICI y cargar CRL
+C -> N: reemplazo atómico de tabla propia
+note over G,N: No se ejecutó despliegue en producción.
+El firewall existente puede imponer drops adicionales.
+@enduml

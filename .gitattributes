@@ -1,0 +1,2 @@
+# Los diffs de compatibilidad conservan espacios de contexto de unified diff.
+*.patch -whitespace

@@ -1,0 +1,32 @@
+--- a/blockservi/portal.py
++++ b/blockservi/portal.py
+@@ -243,6 +243,14 @@
+     }}
+     let statusTimer=null;
+     function checkStatus(){{
++      if(equipo){{
++        fetch("/api/pedido/"+encodeURIComponent(equipo),{{cache:"no-store"}})
++        .then(function(r){{if(!r.ok)throw Error();return r.json()}}).then(function(d){{
++          const active=d.modo==="unlocked";setStatus(active?"active":"pending");
++          document.getElementById("btn-generate").disabled=active;
++        }}).catch(function(){{estadoEl.textContent="SIN CONEXION";}});
++        return;
++      }}
+       var code=codeEl.value;if(!code)return;
+       fetch("/api/estado-codigo/"+code,{{cache:"no-store"}}).then(function(r){{return r.json()}})
+         .then(function(d){{
+@@ -255,6 +263,14 @@
+         }}).catch(function(){{}});
+     }}
+     function gen(){{
++      if(equipo){{
++        fetch("/api/pedido/"+encodeURIComponent(equipo)+"?nuevo=1",{{cache:"no-store"}})
++        .then(function(r){{if(!r.ok)throw Error();return r.json()}}).then(function(d){{
++          if(!/^[0-9]{{6}}$/.test(d.codigo||""))throw Error();
++          codeEl.value=d.codigo;display(d.codigo);checkStatus();
++        }}).catch(function(){{estadoEl.textContent="NO SE PUDO SOLICITAR EL CODIGO";}});
++        return;
++      }}
+       // Sin token (URL unica /activar) el equipo es este navegador: el web_id
+       // del localStorage. Cada movil genera su codigo y queda separado del resto.
+       const code=String(Math.floor(100000+Math.random()*900000));

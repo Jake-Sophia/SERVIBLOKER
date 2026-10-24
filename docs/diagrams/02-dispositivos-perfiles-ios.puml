@@ -1,0 +1,21 @@
+@startuml
+title Generación individual autocontenida
+actor Administrador
+participant "web.handle_virtual_create" as W
+database "Store / devices.json" as D
+participant "Controlador root / Authority" as C
+participant "profile.build_profile" as P
+Administrador -> W: POST /api/virtual/devices (sesión)
+W -> D: add / token aleatorio 192 bits / profile_uuid
+D --> W: RESTRICTED
+C -> D: leer dispositivo nuevo
+C -> C: firmar certificado SAN individual
+PKCS12 exclusivo / clave CA root
+Administrador -> P: GET /perfil/{token}.mobileconfig (sesión)
+alt certificado pendiente y VPN habilitada
+P --> Administrador: HTTP 409
+else DNS o identidad lista
+P --> Administrador: DNS + VPN/certificados opcionales
+WiFi opcional por POST
+end
+@enduml

@@ -1,0 +1,37 @@
+@startuml
+title Arquitectura implementada VPS–iPhone
+node iPhone {
+ artifact "mobileconfig individual
+DNS + VPN opcional + identidad + WiFi opcional" as P
+}
+node "VPS Linux" {
+ component "Proxy HTTPS público" as H
+ component "aiohttp Service
+portal / panel / API / DoH" as W
+ component "Policy + Filter + Upstream" as D
+ database "Store / Codes / Licenses / ApiKeys" as J
+ database "SQLite límites, DNS permitidos, observaciones" as Q
+ component "Controlador root independiente" as C
+ component "strongSwan IKEv2 / VICI root" as V
+ component "nft inet iblocker + NAT
+VIP y reqid autenticado" as N
+ artifact "CA privada root / CRL" as CA
+}
+cloud Internet
+P --> H: DoH individual / portal
+H --> W: loopback / proxy confiable
+W --> D
+W --> J
+D --> J
+D --> Q: aprendizaje A/AAAA autorizado
+C --> J: leer estado
+C --> Q
+C --> CA
+C --> V: sesiones y CRL
+C --> N: política / timeout
+P --> V: IKEv2 certificado
+V --> N: tráfico descifrado autenticado
+N --> Internet
+note bottom of N: Aplicación real Linux y compatibilidad iPhone pendientes de laboratorio.
+El tráfico que no atraviesa VPN no está bajo este firewall.
+@enduml

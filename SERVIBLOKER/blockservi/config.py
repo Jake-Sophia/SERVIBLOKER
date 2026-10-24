@@ -64,6 +64,12 @@ class Config:
     vpn_auth_pass: str
     vpn_display: str
 
+    trusted_proxies: tuple[str, ...] = ("127.0.0.1/32", "::1/128")
+    legacy_admin_query: bool = False
+    credentials_dir: str = ""
+    vpn_ca_file: str = ""
+    doh_server_addresses: tuple[str, ...] = ()
+
     def device_dns_host(self, token: str) -> str:
         return f"{self.device_prefix}{token}.{self.device_dns_suffix}"
 
@@ -166,11 +172,31 @@ def load(path: str) -> Config:
         # Con un unico perfil para todos los telefonos no hay token en el Host,
         # asi que el equipo se identifica por su IP. Ponerlo a 0 obliga a usar
         # un perfil por equipo, con su host y su token.
-        trust_ip=get_bool("general", "trust_ip", True),
+        trust_ip=get_bool("general", "trust_ip", False),
+        trusted_proxies=_split(get("network", "trusted_proxies", "127.0.0.1/32,::1/128")),
+        legacy_admin_query=get_bool("general", "legacy_admin_query", False),
+        credentials_dir=get("vpn", "credentials_dir", os.path.join(data_dir, "credentials")),
+        doh_server_addresses=_split(get("general", "doh_server_addresses", "")),
+        vpn_ca_file=get("vpn", "ca_file", os.path.join(data_dir, "vpn-ca.der")),
     )
 
-    if config.admin_key == "" or config.admin_key == "cambia-esta-clave":
+    if not config.admin_key or config.admin_key.lower().startswith(("cambia", "change", "pon-tu")):
         raise ConfigError("general.admin_key debe cambiarse antes de arrancar")
+    import ipaddress
+    for address in config.doh_server_addresses:
+        try:
+            ipaddress.ip_address(address)
+        except ValueError as exc:
+            raise ConfigError("doh_server_addresses debe contener direcciones IP") from exc
+    for network in config.trusted_proxies:
+        try:
+            ipaddress.ip_network(network)
+        except ValueError as exc:
+            raise ConfigError("trusted_proxies debe contener redes CIDR") from exc
+    if config.vpn_enabled and (not config.doh_server_addresses or not config.vpn_remote or not config.vpn_address):
+        raise ConfigError("VPN requiere vpn_address, vpn_remote y general.doh_server_addresses")
+    if config.vpn_enabled and (config.vpn_auth_user or config.vpn_auth_pass):
+        raise ConfigError("retire credenciales VPN globales: se usan certificados individuales")
     if not config.domain:
         raise ConfigError("general.domain no puede estar vacío")
     return config

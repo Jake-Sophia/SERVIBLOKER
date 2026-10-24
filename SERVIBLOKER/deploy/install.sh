@@ -3,6 +3,11 @@
 # Uso: sudo ./install.sh ruta/al/blockservi.ini
 set -euo pipefail
 
+if [ "${2:-}" != "--apply-reviewed" ]; then
+ echo 'Instalación requiere: install.sh CONFIG --apply-reviewed' >&2
+ echo 'Revisar puertos, respaldo y servicio actual antes de aplicar.' >&2
+ exit 2
+fi
 CONFIG_ORIGEN="${1:-}"
 if [ -z "$CONFIG_ORIGEN" ] || [ ! -f "$CONFIG_ORIGEN" ]; then
 	echo "Uso: sudo $0 /ruta/blockservi.ini" >&2
@@ -17,6 +22,15 @@ SUFIJO="$(grep -E '^device_dns_suffix' "$CONFIG_ORIGEN" | head -1 | cut -d= -f2 
 if [ "$(id -u)" -ne 0 ]; then
 	echo "Este instalador necesita root." >&2
 	exit 1
+fi
+
+# Validar antes de copiar/borrar código o reiniciar servicios.
+PYTHONPATH="$ORIGEN" python3 -c 'import sys; from blockservi.config import load; load(sys.argv[1])' "$CONFIG_ORIGEN"
+if [ -d /opt/blockservi/blockservi ] || [ -d /etc/blockservi ]; then
+ backup_dir=$(mktemp -d /root/blockservi-backup.XXXXXX)
+ [ ! -d /opt/blockservi/blockservi ] || cp -a /opt/blockservi/blockservi "$backup_dir/code"
+ [ ! -d /etc/blockservi ] || cp -a /etc/blockservi "$backup_dir/config"
+ echo "Copia privada del código/configuración anterior: $backup_dir"
 fi
 
 echo "==> Instalando paquetes"

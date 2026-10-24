@@ -1,0 +1,128 @@
+--- a/blockservi/web.py
++++ b/blockservi/web.py
+@@ -123,6 +123,7 @@
+         self.organization = organization
+         self.limiter = RateLimiter()
+         self.started_at = time.time()
++        self._individual_activation_lock = asyncio.Lock()
+ 
+     def _peer_ip(self, request: web.Request) -> str:
+         """IP real del cliente.
+@@ -411,6 +412,13 @@
+             }
+         )
+ 
++    async def _revoke_individual_access(self, record):
++        token = (record or {}).get("token", "")
++        if token and await asyncio.to_thread(self.store.device, token):
++            await asyncio.to_thread(self.store.set_unlocked_until, token, 0)
++            return True
++        return False
++
+     @admin_required
+     async def handle_revoke(self, request: web.Request) -> web.StreamResponse:
+         """Deja de valer un codigo ya activado, sin tocar el resto del equipo."""
+@@ -418,9 +426,11 @@
+         code = str(data.get("codigo", "")).strip()
+         if not code:
+             return web.json_response({"error": "codigo_vacio"}, status=400)
++        record = await asyncio.to_thread(self.codes.get, code)
+         entry = await asyncio.to_thread(self.codes.revoke, code)
+         if not entry:
+             return web.json_response({"error": "codigo_no_encontrado"}, status=404)
++        await self._revoke_individual_access(record)
+         return web.json_response({"ok": True, "codigo": code})
+ 
+     @admin_required
+@@ -511,7 +521,7 @@
+         await asyncio.to_thread(self.store.set_ip_unlocked_until, ip, 0)
+         return web.json_response({"ok": True, "ip": ip})
+ 
+-    async def _activar(
++    async def _activar_individual_inner(
+         self,
+         code: str,
+         hours: int,
+@@ -529,13 +539,27 @@
+         )
+         if not token and not web_id and not ip:
+             return 404, {"error": "codigo_no_encontrado"}
++        known_device = await asyncio.to_thread(self.store.device, token) if token else None
++        pending_token = await asyncio.to_thread(self.store.find_by_request_code, code)
++        if pending_token and registro and registro.get("token") not in ("", pending_token):
++            return 409, {"error": "codigo_identidad_no_coincide"}
++        individual = known_device is not None
++        if not 1 <= int(hours) <= 2160:
++            return 400, {"error": "horas_invalidas"}
++        if individual:
++            if registro and registro.get("usado_at"):
++                return 409, {"error": "codigo_ya_utilizado"}
++            if not registro and int(time.time()) - int(known_device.get("requested_at", 0)) >= 12 * 3600:
++                return 404, {"error": "codigo_no_encontrado"}
++            if not registro:
++                registro = await asyncio.to_thread(self.codes.register, code, token, "")
+         etiquetas: list[str] = []
+         hasta = 0
+         if token and await asyncio.to_thread(self.store.device, token):
+             device = await asyncio.to_thread(self.store.unlock, token, license_code, hours)
+             hasta = int(device["unlocked_until"])
+             etiquetas.append(f"device {token}")
+-        if web_id:
++        if web_id and not individual:
+             try:
+                 device = await asyncio.to_thread(
+                     self.store.unlock_web, web_id, license_code, hours
+@@ -544,7 +568,7 @@
+                 etiquetas.append(f"web {web_id[:8]}")
+             except KeyError:
+                 pass
+-        if ip:
++        if ip and not individual:
+             acceso = await asyncio.to_thread(self.store.unlock_ip, ip, license_code, hours)
+             hasta = max(hasta, int(acceso["unlocked_until"]))
+             etiquetas.append(f"ip {ip}")
+@@ -552,8 +576,10 @@
+             await asyncio.to_thread(self.codes.activate, code, hours, origen)
+         else:
+             await asyncio.to_thread(self.store.deny, code)
++        if individual:
++            await asyncio.to_thread(self.store.deny, code)
+         # prefer the ip that was actually used or registered
+-        ip_resp = ip or (registro or {}).get("ip", "")
++        ip_resp = "" if individual else ip or (registro or {}).get("ip", "")
+         return 0, {
+             "ok": True,
+             "token": token if isinstance(token, str) else "",
+@@ -565,6 +591,10 @@
+             "hours": hours,
+         }
+ 
++    async def _activar(self, code, hours, license_code, origen, ip_forzada=""):
++        async with self._individual_activation_lock:
++            return await self._activar_individual_inner(code, hours, license_code, origen, ip_forzada)
++
+     @admin_required
+     async def handle_approve(self, request: web.Request) -> web.StreamResponse:
+         data = await request.json()
+@@ -573,6 +603,11 @@
+         license_code = str(data.get("licencia", "")).strip().upper()
+         if not code:
+             return web.json_response({"error": "codigo_vacio"}, status=400)
++        if data.get("individual_only"):
++            record = await asyncio.to_thread(self.codes.get, code)
++            owner = (record or {}).get("token") or await asyncio.to_thread(self.store.find_by_request_code, code)
++            if not owner or not await asyncio.to_thread(self.store.device, owner):
++                return web.json_response({"error": "perfil_individual_requerido"}, status=403)
+         if license_code:
+             result = await asyncio.to_thread(self.licenses.check, license_code)
+             if not result.ok:
+@@ -631,7 +666,8 @@
+             return web.json_response({"error": "codigo_no_encontrado"}, status=404)
+         ip = registro.get("ip", "")
+         await asyncio.to_thread(self.codes.revoke, code)
+-        if ip and hours >= 0:
++        individual = await self._revoke_individual_access(registro)
++        if ip and not individual and hours >= 0:
+             await asyncio.to_thread(self.store.set_ip_unlocked_until, ip, 0)
+         return web.json_response({"ok": True, "codigo": code, "ip": ip})
+ 

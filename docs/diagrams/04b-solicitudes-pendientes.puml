@@ -1,0 +1,14 @@
+@startuml
+title Solicitudes pendientes y rechazo
+actor Administrador
+participant Service as W
+database Store as S
+database Codes as C
+Administrador -> W: panel autenticado
+W -> S: pending_requests / listado
+Administrador -> W: POST /api/admin/no {codigo}
+W -> S: deny / eliminar solicitud
+W -> C: revoke / marcar revoked_at
+note over S,C: Un código rechazado no puede aprobarse después.
+Una nueva solicitud recibe código distinto.
+@enduml

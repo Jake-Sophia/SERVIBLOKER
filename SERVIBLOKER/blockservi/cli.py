@@ -24,6 +24,7 @@ from .rules import MODE_STRICT, MODE_UNLOCKED, Policy
 from .store import Store
 from .upstream import Upstream
 from .web import Service
+from .virtual import VirtualState
 
 DEFAULT_CONFIG = os.environ.get("BLOCKSERVI_CONFIG", "blockservi.ini")
 
@@ -35,8 +36,8 @@ class Components:
         self.policy.ensure_allowed(
             [config.portal_host, config.device_dns_suffix, config.domain]
         )
-        self.store = Store(config.state_file)
         self.licenses = Licenses(config.licenses_file)
+        self.store = Store(config.state_file, self.licenses)
         self.codes = Codes(os.path.join(config.data_dir, 'codes.json'))
         self.api_keys = ApiKeys(os.path.join(config.data_dir, 'api_keys.json'))
         self.log = QueryLog(config.log_file, config.log_max_bytes)
@@ -47,6 +48,7 @@ class Components:
             cache_ttl=config.cache_ttl,
             cache_max=config.cache_max,
         )
+        self.virtual = VirtualState(config.data_dir)
         self.filter = Filter(
             self.policy,
             self.store,
@@ -54,6 +56,8 @@ class Components:
             self.log,
             blocked_rcode=config.blocked_rcode,
             captive_ip=config.captive_ip,
+            trust_ip=config.trust_ip,
+            virtual=self.virtual,
         )
         self.service = Service(
             config, self.filter, self.store, self.licenses, self.codes, self.api_keys
@@ -176,7 +180,7 @@ def cmd_device(args: argparse.Namespace) -> int:
         print(f"etiqueta: {device['label'] or '(sin etiqueta)'}")
         print(f"DNS: {config.device_dns_host(token)}")
         print(f"activacion: {config.activation_url(token)}")
-        print(f"perfil: {config.portal_origin()}/perfil/{token}.mobileconfig?k=CLAVE")
+        print(f"perfil: {config.portal_origin()}/perfil/{token}.mobileconfig (sesión de panel o X-Admin-Key)")
         if args.caddy_dir:
             cmd_caddy(args, store=store)
         return 0
@@ -240,9 +244,19 @@ def cmd_profile(args: argparse.Namespace) -> int:
     if store.device(token) is None:
         print(f"Dispositivo desconocido: {token}", file=sys.stderr)
         return 2
-    data = build_profile(config, token)
+    wifi = None
+    if args.wifi_ssid:
+        password = ""
+        if args.wifi_password_file:
+            with open(args.wifi_password_file, encoding="utf-8") as stream:
+                password = stream.read().rstrip("\n")
+        wifi = {"ssid": args.wifi_ssid, "security": args.wifi_security, "password": password,
+                "auto_join": not args.wifi_no_autojoin}
+    data = build_profile(config, token, profile_uuid=store.device(token).get("profile_uuid"), wifi=wifi)
     if args.output:
-        with open(args.output, "wb") as handle:
+        fd = os.open(args.output, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as handle:
             handle.write(data)
         print(f"Perfil escrito en {args.output}")
         print("Instalacion en el iPhone: abre el fichero en Safari y pulsa Instalar.")
@@ -375,6 +389,10 @@ def build_parser() -> argparse.ArgumentParser:
     profile_parser = sub.add_parser("profile", help="genera el perfil para instalar en el iPhone")
     profile_parser.add_argument("token")
     profile_parser.add_argument("-o", "--output", default="")
+    profile_parser.add_argument("--wifi-ssid", default="")
+    profile_parser.add_argument("--wifi-security", default="WPA2", choices=("None", "WPA2", "WPA3"))
+    profile_parser.add_argument("--wifi-password-file", default="")
+    profile_parser.add_argument("--wifi-no-autojoin", action="store_true")
     profile_parser.set_defaults(func=cmd_profile)
 
     decide_parser = sub.add_parser("decide", help="consulta como se resuelve un dominio")

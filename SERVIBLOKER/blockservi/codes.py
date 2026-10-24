@@ -18,6 +18,8 @@ import threading
 import time
 from typing import Any
 
+from .persistence import serialized, write_json
+
 CODE_RE = re.compile(r"^[0-9]{6}$")
 CODE_BYTES = 8
 
@@ -33,7 +35,7 @@ class Codes:
     def reload(self) -> None:
         with self._lock:
             try:
-                mtime = os.path.getmtime(self.path)
+                mtime = os.stat(self.path).st_mtime_ns
             except FileNotFoundError:
                 self._mtime = -1.0
                 self._codes = {}
@@ -58,20 +60,14 @@ class Codes:
     def _write(self) -> None:
         directory = os.path.dirname(self.path) or "."
         os.makedirs(directory, mode=0o700, exist_ok=True)
-        temp = f"{self.path}.tmp"
-        payload = json.dumps({"codes": self._codes}, indent=2, sort_keys=True)
-        with open(temp, "w", encoding="utf-8") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temp, self.path)
-        os.chmod(self.path, 0o600)
-        self._mtime = os.path.getmtime(self.path)
+        write_json(self.path, {"codes": self._codes})
+        self._mtime = os.stat(self.path).st_mtime_ns
 
     @staticmethod
     def is_valid(code: str) -> bool:
         return bool(CODE_RE.match(str(code or "").strip()))
 
+    @serialized
     def generate(self, hours: int, valid_days: int = 30) -> dict[str, Any]:
         """Crea un codigo sueltas, sin equipo asociado, para entregarlo a alguien.
 
@@ -108,6 +104,7 @@ class Codes:
             self._write()
             return self._view(dict(entry))
 
+    @serialized
     def redeem(self, code: str, token: str, ip: str = "") -> tuple[int, dict[str, Any] | None]:
         """Canjea un codigo de los generados por el administrador.
 
@@ -121,7 +118,7 @@ class Codes:
             if entry is None or not entry.get("origen") == "panel":
                 return 0, None
             now = int(time.time())
-            if entry.get("usado_at"):
+            if entry.get("usado_at") or entry.get("revoked_at"):
                 return 0, None
             if int(entry.get("valido_hasta", 0)) and int(entry["valido_hasta"]) < now:
                 return 0, None
@@ -135,6 +132,7 @@ class Codes:
             self._write()
             return int(entry.get("horas", 24)), dict(entry)
 
+    @serialized
     def register(self, code: str, token: str = "", ip: str = "") -> dict[str, Any]:
         """Da de alta el codigo que ha generado el movil. Es idempotente."""
         code = str(code or "").strip()
@@ -156,6 +154,8 @@ class Codes:
                     "ip": "",
                 }
                 self._codes[code] = entry
+            if entry.get("origen") == "panel" or (entry.get("token") and entry["token"] != token) or (not token and entry.get("ip") and entry["ip"] != ip):
+                raise ValueError("codigo_pertenece_a_otro_equipo")
             if token:
                 entry["token"] = token
             if ip:
@@ -164,16 +164,20 @@ class Codes:
             self._write()
             return dict(entry)
 
+    @serialized
     def bind(self, code: str, token: str) -> bool:
         with self._lock:
             self.reload()
             entry = self._codes.get(str(code or "").strip())
             if entry is None:
                 return False
+            if entry.get("token") and entry["token"] != token:
+                return False
             entry["token"] = token
             self._write()
             return True
 
+    @serialized
     def activate(self, code: str, hours: int, by: str = "panel") -> dict[str, Any] | None:
         with self._lock:
             self.reload()
@@ -190,6 +194,7 @@ class Codes:
             self._write()
             return dict(entry)
 
+    @serialized
     def revoke(self, code: str) -> bool:
         with self._lock:
             self.reload()
@@ -197,6 +202,7 @@ class Codes:
             if entry is None:
                 return False
             entry["active"] = False
+            entry["revoked_at"] = int(time.time())
             entry["activated_at"] = 0
             entry["activated_by"] = ""
             entry["expires_at"] = 0
@@ -216,7 +222,8 @@ class Codes:
         return {
             "id": str(entry.get("id", "")),
             "active": active,
-            "pending": not active,
+            "pending": not active and not entry.get("revoked_at"),
+            "revoked_at": int(entry.get("revoked_at", 0)),
             "created_at": int(entry.get("created_at", 0)),
             "activated_at": int(entry.get("activated_at", 0)),
             "activated_by": str(entry.get("activated_by", "")),
@@ -237,6 +244,7 @@ class Codes:
             views = [self._view(dict(entry)) for entry in self._codes.values()]
         return sorted(views, key=lambda row: row["created_at"], reverse=True)
 
+    @serialized
     def prune(self, keep: int = 500) -> None:
         """Deja solo los codigos recientes para que el fichero no crezca sin fin."""
         with self._lock:

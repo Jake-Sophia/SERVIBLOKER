@@ -1,0 +1,23 @@
+@startuml
+title Establecimiento IKEv2 y mapeo de identidad
+actor iPhone
+participant strongSwan as S
+participant "Controlador root" as C
+database "CA / certificados / CRL" as P
+database Store as D
+database "nft inet iblocker" as N
+iPhone -> S: IKEv2 UDP500/4500, certificado y SAN individual
+S -> P: cadena, validez, prueba de clave y CRL strict
+alt autenticación válida
+S -> S: asignar VIP de pools, CHILD_SA y reqid
+MOBIKE/reconexión según negociación
+C -> S: list_sas VICI
+S --> C: remote-id, remote-vips, reqid, bytes
+C -> D: estado efectivo por token
+C -> N: vincular VIP + reqid autenticado
+else certificado inválido/revocado
+S --> iPhone: rechazar autenticación
+end
+note over C,N: Simultaneidad observada de una identidad:
+retirar permisos y terminar SA; no detecta clones alternados.
+@enduml

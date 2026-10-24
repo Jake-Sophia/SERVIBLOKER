@@ -1,0 +1,29 @@
+[Unit]
+Description=IBLOKER VPN sessions and nftables controller
+After=network-online.target strongswan.service blockservi.service
+Requires=blockservi.service
+Before=shutdown.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/blockservi
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/blockservi/.venv/bin/python -m blockservi.controller --config /etc/blockservi/blockservi.ini --firewall /etc/blockservi/firewall.json --ca-dir /var/lib/iblocker-pki
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=15
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+ReadWritePaths=/var/lib/blockservi /var/lib/iblocker-pki /etc/swanctl/x509crl
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_CHOWN CAP_DAC_OVERRIDE
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target

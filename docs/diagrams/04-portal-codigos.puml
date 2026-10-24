@@ -1,0 +1,25 @@
+@startuml
+title Solicitud y canje sin identidad por IP pública
+actor iPhone
+participant "Portal JS" as J
+participant Service as W
+database Codes as C
+database Store as S
+iPhone -> J: /activar/{token}
+J -> W: /api/pedido/{token}?nuevo=1
+W -> S: request / seis dígitos criptográficos
+W -> C: register vinculado al token
+W --> J: código e identidad propia
+loop cada cinco segundos
+J -> W: estado-codigo + X-Device-Token
+W --> J: id/active/expires_at (sin token de otros)
+end
+opt código pregenerado
+J -> W: POST /api/canjear {codigo,token}
+W -> C: redeem dentro de flock activation.lock
+C -> C: comprobar uso/vencimiento/revocación
+consumir una vez
+W -> S: unlock sólo token
+W --> J: autorización persistida
+end
+@enduml

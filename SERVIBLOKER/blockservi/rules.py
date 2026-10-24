@@ -10,6 +10,14 @@ DENY = "deny"
 
 MODE_STRICT = "strict"
 MODE_UNLOCKED = "unlocked"
+# Servicios de identidad, conectividad y protección antirrobo: no desactivables por estas listas.
+SYSTEM_ESSENTIAL = (
+    "icloud.com", "icloud-content.com", "apple-dns.net", "push.apple.com", "ls.apple.com",
+    "findmy.apple.com", "findme.apple.com", "fmip.apple.com", "fmf.apple.com",
+    "albert.apple.com", "gs.apple.com", "captive.apple.com", "time.apple.com", "time-ios.apple.com",
+    "appleid.apple.com", "idmsa.apple.com", "gsa.apple.com", "account.apple.com",
+    "ocsp.apple.com", "ocsp2.apple.com", "valid.apple.com", "crl.apple.com",
+)
 
 
 class PolicyError(Exception):
@@ -108,6 +116,9 @@ class Policy:
         name = normalize(raw_name)
         if not name:
             return Decision(False, mode, "nombre vacio")
+
+        if any(name == host or name.endswith("." + host) for host in SYSTEM_ESSENTIAL):
+            return Decision(True, mode, "servicio esencial Apple")
 
         rule = self._match(self.deny_always, name)
         if rule is not None:

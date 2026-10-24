@@ -1,3 +1,5 @@
 aiohttp>=3.9
 dnslib>=0.9.24
 certifi>=2024.2.2
+cryptography>=43
+vici>=5.9.6

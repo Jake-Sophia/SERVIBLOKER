@@ -7,7 +7,7 @@
 set -euo pipefail
 
 ORIGEN="$(cd "$(dirname "$0")/.." && pwd)/../data/licenses.json"
-DESTINO="${1:-root@209.145.55.123}"
+DESTINO="${1:?Indicar usuario@host explícitamente}"
 CLAVE="${BLOCKSERVI_SSH_KEY:-}"
 EXTRA=()
 [ -n "$CLAVE" ] && EXTRA=(-i "$CLAVE" -o BatchMode=yes)

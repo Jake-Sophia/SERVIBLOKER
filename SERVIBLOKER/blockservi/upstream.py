@@ -51,7 +51,7 @@ class Upstream:
     def _key(self, request: DNSRecord) -> tuple:
         question = request.q
         name = str(question.qname).lower().rstrip(".")
-        return (name, int(question.qtype), int(request.header.rd))
+        return bytes(request.pack())[2:]
 
     def _cache_get(self, key: tuple) -> bytes | None:
         entry = self._cache.get(key)
@@ -64,7 +64,12 @@ class Upstream:
             self.misses += 1
             return None
         self.hits += 1
-        return payload
+        reply = DNSRecord.parse(payload)
+        elapsed = max(0, int(time.monotonic() - (expires - self._cache_ttl_for(payload))))
+        for rr in [*reply.rr, *reply.auth, *reply.ar]:
+            if int(rr.rtype) != 41:
+                rr.ttl = max(0, int(rr.ttl) - elapsed)
+        return reply.pack()
 
     def _cache_put(self, key: tuple, payload: bytes) -> None:
         try:
@@ -73,14 +78,16 @@ class Upstream:
             return
         if rcode not in CACHEABLE_RCODES:
             return
-        if len(self._cache) > self.cache_max:
+        if len(self._cache) >= self.cache_max:
             now = time.monotonic()
             expired = [item for item, value in self._cache.items() if value[0] < now]
             for item in expired:
                 self._cache.pop(item, None)
-            if len(self._cache) > self.cache_max:
+            if len(self._cache) >= self.cache_max:
                 self._cache.clear()
-        self._cache[key] = (time.monotonic() + self._cache_ttl_for(payload), payload)
+        ttl = self._cache_ttl_for(payload)
+        if ttl > 0 and self.cache_max > 0:
+            self._cache[key] = (time.monotonic() + ttl, payload)
 
     def _cache_ttl_for(self, payload: bytes) -> int:
         try:
@@ -91,14 +98,14 @@ class Upstream:
             for rr in reply.auth:
                 if int(rr.rtype) == int(QTYPE.SOA):
                     try:
-                        return max(30, int(rr.rdata.times[4]))
+                        return max(0, min(self.cache_ttl, int(rr.ttl), int(rr.rdata.times[4])))
                     except Exception:
                         return 60
             return min(self.cache_ttl, 60)
-        ttls = [int(rr.ttl) for rr in reply.rr if int(rr.ttl) > 0]
+        ttls = [int(rr.ttl) for rr in [*reply.rr, *reply.auth, *reply.ar] if int(rr.rtype) != 41]
         if not ttls:
             return self.cache_ttl
-        return max(1, min(ttls))
+        return max(0, min(self.cache_ttl, min(ttls)))
 
     async def resolve(self, wire: bytes) -> bytes:
         try:
@@ -126,6 +133,7 @@ class Upstream:
         except BaseException as exc:
             if not future.done():
                 future.set_exception(exc)
+                future.exception()  # Recuperar también si no había otros consumidores.
             raise
         finally:
             self._inflight.pop(key, None)
@@ -155,6 +163,11 @@ class Upstream:
                     payload = await self._forward_doh(endpoint, wire)
                 else:
                     payload = await self._forward_udp(endpoint, request)
+                parsed = DNSRecord.parse(payload)
+                if parsed.header.rcode in (RCODE.SERVFAIL, RCODE.REFUSED):
+                    raise UpstreamError("resolvente rechaza o falla")
+                if parsed.header.tc:
+                    raise UpstreamError("respuesta truncada; reintentar otro resolvente DoH")
                 return payload
             except Exception as exc:
                 errors.append(f"{endpoint}: {exc}")
@@ -176,7 +189,7 @@ class Upstream:
         return body
 
     async def _forward_udp(self, server: str, request: DNSRecord) -> bytes:
-        query = DNSRecord.question(str(request.q.qname), request.q.qtype)
+        query = DNSRecord.parse(request.pack())
         query.header.rd = 1
         loop = asyncio.get_running_loop()
         transport, protocol = await loop.create_datagram_endpoint(
@@ -189,6 +202,7 @@ class Upstream:
             transport.close()
         if payload is None:
             raise UpstreamError("sin respuesta")
+        self._check_matching(payload, query.pack())
         reply = DNSRecord.parse(payload)
         if not reply.header.qr:
             raise UpstreamError("respuesta invalida")
@@ -199,10 +213,12 @@ class Upstream:
     def _check_matching(body: bytes, query: bytes) -> None:
         reply = DNSRecord.parse(body)
         original = DNSRecord.parse(query)
-        if not reply.header.qr:
-            raise UpstreamError("respuesta sin QR")
+        if not reply.header.qr or reply.header.id != original.header.id or len(reply.questions) != 1:
+            raise UpstreamError("respuesta sin QR, ID o pregunta válida")
         if str(reply.q.qname).lower() != str(original.q.qname).lower():
             raise UpstreamError("la respuesta no coincide con la consulta")
+        if int(reply.q.qclass) != int(original.q.qclass):
+            raise UpstreamError("la clase de respuesta no coincide")
         if int(reply.q.qtype) != int(original.q.qtype):
             raise UpstreamError("el tipo de la respuesta no coincide")
 

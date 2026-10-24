@@ -1,0 +1,16 @@
+@startuml
+title Persistencia compatible y exclusión
+participant "Web / CLI / workers" as W
+participant "persistence.file_lock" as F
+database "JSON heredados" as J
+database "virtual.sqlite3" as Q
+participant "Controlador root" as C
+W -> F: flock exclusivo + RLock por ruta
+F -> J: reload mtime_ns / mutación
+F -> J: temporal 0600 / fsync / atomic replace / fsync directorio
+W -> Q: BEGIN IMMEDIATE para límites
+C -> J: leer autorizaciones sin cambiar tokens antiguos
+C -> Q: observación VICI/firewall y errores
+note over F,J: Writers externos deben respetar flock.
+No hay transacción distribuida entre JSON.
+@enduml

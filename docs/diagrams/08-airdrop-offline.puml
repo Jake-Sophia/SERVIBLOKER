@@ -1,0 +1,18 @@
+@startuml
+title Entrega offline por AirDrop
+actor "iPhone A (internet)" as A
+participant VPS
+actor "iPhone B (sin internet inicial)" as B
+A -> VPS: generar identidad individual autenticada
+VPS --> A: mobileconfig autocontenido y URL del equipo
+A -> B: AirDrop del archivo exclusivo
+B -> B: usuario instala en Ajustes
+WiFi/Bluetooth habilitados manualmente
+note right of B: Sin consulta VPS al instalar.
+Perfil estático no ejecuta código ni genera token.
+B -> B: posteriormente se conecta a WiFi
+B -> VPS: DoH / IKEv2 con identidad del perfil
+VPS --> B: RESTRICTED hasta autorización
+note over A,B: Copiar el mismo archivo comparte identidad.
+Sin MDM no hay atestación hardware.
+@enduml

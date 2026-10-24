@@ -1,1104 +1,534 @@
+"""Regresiones sin servicios externos. HTTP se despacha por el router aiohttp en memoria."""
 from __future__ import annotations
 
 import asyncio
+import base64
+import concurrent.futures
+import dataclasses
+import datetime as dt
 import json
 import os
+from pathlib import Path
 import plistlib
+import subprocess
 import sys
 import tempfile
 import time
+import unittest
+from unittest.mock import patch
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from aiohttp.test_utils import TestClient, TestServer
-from dnslib import A, DNSQuestion, DNSRecord, QTYPE, RCODE, RR
+from aiohttp import web
+from aiohttp.test_utils import make_mocked_request
+from cryptography import x509
+from cryptography.hazmat.primitives.serialization import pkcs12
+from dnslib import A, AAAA, DNSHeader, DNSRecord, QTYPE, RCODE, RR, SOA
 
 from blockservi.cli import Components
 from blockservi.codes import Codes
-from blockservi.config import load as load_config
-from blockservi.licenses import Licenses
+from blockservi.config import load
+from blockservi.controller import render_rules, sessions_from_vici
+from blockservi.pki import Authority
+from blockservi.plain import PlainBridge
+from blockservi.portal import admin_page, device_page
 from blockservi.profile import build_profile
-from blockservi.querylog import QueryLog
-from blockservi.rules import MODE_STRICT, MODE_UNLOCKED, Policy, normalize
+from blockservi.rules import MODE_STRICT, MODE_UNLOCKED, Policy, SYSTEM_ESSENTIAL
 from blockservi.store import Store
+from blockservi.upstream import Upstream, UpstreamError
+from blockservi.virtual import VirtualState
 
-POLICY_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "blockservi", "policy.json")
-
-SPEC = {
-    "strict_push": True,
-    "deny_always": ["itunes.apple.com", "ls.apple.com", "=fmzmobile.icloud.com", "re:^doh\\."],
-    "allow_strict": ["=portal.ejemplo.com"],
-    "allow_strict_optional": ["fcm.googleapis.com"],
-    "blocked_qtypes": ["PTR", "DS"],
-}
+ROOT = Path(__file__).resolve().parents[1]
 
 
-class FakeUpstream:
-    def __init__(self) -> None:
-        self.calls: list[str] = []
-        self.hits = 0
-        self.misses = 0
+def configuration(directory):
+    path = Path(directory) / 'test.ini'
+    path.write_text(f'''[general]
+domain=example.com
+portal_host=portal.example.com
+admin_key=test-admin-only
+data_dir={directory}
+policy_file={ROOT / "blockservi/policy.json"}
+[network]
+http_port=0
+plain_port=0
+[upstream]
+doh=
+udp=
+''')
+    return load(str(path))
 
-    def stats(self) -> dict[str, int]:
-        return {"hits": self.hits, "misses": self.misses, "cache": 0}
 
-    async def resolve(self, wire: bytes) -> bytes:
-        self.calls.append(str(DNSRecord.parse(wire).q.qname).lower())
+class Resolver:
+    def __init__(self):
+        self.calls = 0
+
+    async def resolve(self, wire):
+        self.calls += 1
         query = DNSRecord.parse(wire)
-        reply = DNSRecord.question(str(query.q.qname), QTYPE[int(query.q.qtype)])
-        reply.header.id = query.header.id
-        reply.header.qr = 1
-        reply.header.rd = 0
-        reply.header.ra = 1
-        reply.add_answer(RR("ns.example.", QTYPE.A, rdata=A("203.0.113.7"), ttl=120))
+        reply = query.reply()
+        if query.q.qtype == QTYPE.A:
+            reply.add_answer(RR(str(query.q.qname), QTYPE.A, rdata=A('8.8.4.4'), ttl=30))
         return reply.pack()
 
-
-def make_config(directory: str, token: str = "aabbccddeeff", captive_ip: str = ""):
-    path = os.path.join(directory, "blockservi.ini")
-    with open(path, "w", encoding="utf-8") as handle:
-        handle.write(
-            f"""[general]
-domain = ejemplo.com
-portal_host = app.ejemplo.com
-device_dns_suffix = dns.ejemplo.com
-admin_key = clave-de-prueba
-data_dir = {directory}
-state_file = {directory}/devices.json
-licenses_file = {directory}/licenses.json
-policy_file = {POLICY_PATH}
-log_file = {directory}/blocked.log
-unlock_hours = 24
-captive_ip = {captive_ip}
-request_hours = 24
-
-[network]
-http_host = 127.0.0.1
-http_port = 0
-plain_host = 127.0.0.1
-plain_port = 0
-
-[upstream]
-doh =
-udp =
-"""
-        )
-    return load_config(path)
+    def stats(self):
+        return {'upstream_calls': self.calls}
 
 
-def test_rules():
-    assert normalize(" YouTube.com. ") == "youtube.com"
-    policy = Policy(SPEC)
-    assert not policy.decide("youtube.com", MODE_STRICT).allow
-    assert not policy.decide("m.youtube.com", MODE_STRICT).allow
-    assert not policy.decide("t.me", MODE_STRICT).allow
-    assert policy.decide("t.me", MODE_UNLOCKED).allow
-    assert not policy.decide("fmzmobile.icloud.com", MODE_STRICT).allow
-    assert not policy.decide("sub.itunes.apple.com", MODE_UNLOCKED).allow
-    assert not policy.decide("doh.ejemplo.net", MODE_UNLOCKED).allow
-    assert policy.decide("fcm.googleapis.com", MODE_STRICT).allow
-    assert policy.decide("cualquier-cosa.net", MODE_UNLOCKED).allow
-    assert not policy.decide("cualquier-cosa.net", MODE_STRICT).allow
-    assert policy.check_qtype("DS") is not None
-    assert policy.check_qtype("A") is None
-    policy.spec["strict_push"] = False
-    assert not Policy(SPEC | {"strict_push": False}).decide("fcm.googleapis.com", MODE_STRICT).allow
+class Client:
+    """Despacho real de rutas/middleware, sin abrir sockets."""
+    def __init__(self, app):
+        self.app = app
+        app.freeze()
 
-
-def test_policy_lists():
-    policy = Policy.load(POLICY_PATH)
-    policy.ensure_allowed(["app.ejemplo.com", "dns.ejemplo.com"])
-    must_pass_strict = [
-        "app.ejemplo.com",
-        "dev-aabb.dns.ejemplo.com",
-    ]
-    for name in must_pass_strict:
-        assert policy.decide(name, MODE_STRICT).allow, name
-    must_fail_always = [
-        "ibooks.apple.com",
-        "p72-fmip.icloud.com",
-        "fmip.fe2.apple-dns.net",
-        "itunes.apple.com",
-        "xp.apple.com",
-        "books.apple.com",
-        "ls.apple.com",
-        "gspe35-ssl.ls.apple.com",
-        "p01-contactsync.icloud.com",
-        "dns.google",
-        "cloudflare-dns.com",
-    ]
-    for name in must_fail_always:
-        assert not policy.decide(name, MODE_UNLOCKED).allow, name
-        assert not policy.decide(name, MODE_STRICT).allow, name
-    for name in ("appleid.apple.com", "idmsa.apple.com", "gsa.apple.com", "account.apple.com"):
-        assert policy.decide(name, MODE_UNLOCKED).allow, name
-    for name in ("example.org", "www.instagram.com", "tiktok.com", "x.com"):
-        assert not policy.decide(name, MODE_STRICT).allow, name
-
-
-def test_config_tokens():
-    with tempfile.TemporaryDirectory() as directory:
-        config = make_config(directory)
-        token = "aabbccddeeff"
-        assert config.device_dns_host(token) == "dev-aabbccddeeff.dns.ejemplo.com"
-        assert config.token_from_dns_host("dev-aabbccddeeff.dns.ejemplo.com") == token
-        assert config.token_from_dns_host("DEV-AABBCCDDEEFF.DNS.EJEMPLO.COM") == token
-        assert config.token_from_dns_host("dev-aabbccddeeff.dns.ejemplo.com:8443") is None
-        assert config.token_from_dns_host("otro.dns.ejemplo.com") is None
-        assert config.token_from_dns_host("dns.ejemplo.com") is None
-        assert config.token_from_dns_host("app.ejemplo.com") is None
-        assert config.activation_url(token) == "https://app.ejemplo.com/activar/aabbccddeeff"
-
-
-def test_store_and_licenses():
-    with tempfile.TemporaryDirectory() as directory:
-        config = make_config(directory)
-        store = Store(config.state_file)
-        device = store.add("Recepcion", "ABCD-1234")
-        token = device["token"]
-        assert store.mode(token) == MODE_STRICT
-        assert store.mode("999999999999") == MODE_STRICT
-        assert store.mode(None) == MODE_STRICT
-
-        code = "ABCD-1234"
-        with open(config.licenses_file, "w", encoding="utf-8") as handle:
-            json.dump({code: {"status": "active", "expires_at": int(time.time()) + 86400}}, handle)
-        licenses = Licenses(config.licenses_file)
-        assert licenses.check(code).ok
-        assert not licenses.check("NO-EXISTE").ok
-        assert not licenses.check("").ok
-
-        updated = store.unlock(token, code, 24)
-        assert updated["unlocked_until"] > time.time()
-        assert store.mode(token) == MODE_UNLOCKED
-
-        fresh = Store(config.state_file)
-        assert fresh.mode(token) == MODE_UNLOCKED
-        fresh.set_unlocked_until(token, 0)
-        assert Store(config.state_file).mode(token) == MODE_STRICT
-
-        assert store.delete(token)
-        assert not store.delete(token)
-        assert store.device(token) is None
-
-    with tempfile.TemporaryDirectory() as directory:
-        path = os.path.join(directory, "licenses.json")
-        licenses = Licenses(path)
-        assert not licenses.check("ABCD-1234").ok
-        with open(path, "w", encoding="utf-8") as handle:
-            json.dump(
-                {
-                    "REVOCADA": {"status": "revoked", "expires_at": int(time.time()) + 999},
-                    "VENCIDA": {"status": "active", "expires_at": int(time.time()) - 10},
-                },
-                handle,
-            )
-        assert licenses.check("REVOCADA").reason == "licencia_revocada"
-        assert licenses.check("VENCIDA").reason == "licencia_vencida"
-        assert licenses.check("revocada").reason == "licencia_revocada"
-
-
-async def filter_scenario():
-    with tempfile.TemporaryDirectory() as directory:
-        config = make_config(directory)
-        store = Store(config.state_file)
-        upstream = FakeUpstream()
-        parts = Components(config)
-        parts.upstream = upstream
-        parts.filter.upstream = upstream
-        device = store.add("Recepcion")
-        token = device["token"]
-
-        async def rcode(name: str, who: str | None = None, qtype: str = "A") -> int:
-            reply = await parts.filter.handle(DNSRecord.question(name, qtype).pack(), who)
-            assert reply is not None
-            return int(DNSRecord.parse(reply).header.rcode)
-
-        assert await rcode("youtube.com", token) == int(RCODE.NXDOMAIN)
-        assert not any(call.rstrip(".") == "youtube.com" for call in upstream.calls)
-
-        blocked = DNSRecord.parse(
-            await parts.filter.handle(DNSRecord.question("instagram.com", "A").pack(), token)
-        )
-        assert int(blocked.header.rcode) == int(RCODE.NXDOMAIN)
-        assert blocked.auth, "un bloqueo debe incluir SOA para que la app no reintente"
-
-        store.unlock(token, "ABCD-1234", 24)
-        assert await rcode("instagram.com", token) == int(RCODE.NOERROR)
-        assert await rcode("itunes.apple.com", token) == int(RCODE.NXDOMAIN)
-        assert await rcode("gspe35-ssl.ls.apple.com", token) == int(RCODE.NXDOMAIN)
-        assert await rcode("youtube.com", token, "DS") == int(RCODE.NXDOMAIN)
-        assert await rcode("youtube.com", None) == int(RCODE.NXDOMAIN)
-        assert await rcode("instagram.com", None) == int(RCODE.NXDOMAIN)
-        assert await rcode("instagram.com", "999999999999") == int(RCODE.NXDOMAIN)
-
-        multi = DNSRecord()
-        multi.add_question(DNSQuestion("youtube.com", QTYPE.A))
-        multi.add_question(DNSQuestion("t.me", QTYPE.A))
-        reply = await parts.filter.handle(multi.pack(), token)
-        assert int(DNSRecord.parse(reply).header.rcode) == int(RCODE.FORMERR)
-
-        assert await parts.filter.handle(b"no es dns", token) is None
-        assert parts.filter.stats()["blocked"] >= 4
-        entries = QueryLog(config.log_file).tail_file(20)
-        assert any(entry["name"] == "instagram.com" for entry in entries)
-
-
-def test_filter():
-    asyncio.run(filter_scenario())
-
-
-def test_profile():
-    with tempfile.TemporaryDirectory() as directory:
-        config = make_config(directory)
-        data = build_profile(config, "aabbccddeeff")
-        parsed = plistlib.loads(data)
-        assert parsed["PayloadType"] == "Configuration"
-        assert "PayloadRemovalDisallowed" not in parsed
-        payload = parsed["PayloadContent"][0]
-        assert payload["PayloadType"] == "com.apple.dnsSettings.managed"
-        settings = payload["DNSSettings"]
-        assert settings["DNSServerURLs"] == ["https://dev-aabbccddeeff.dns.ejemplo.com/dns-query"]
-        assert settings["MatchDomains"] == []
-
-        # El tunel VPN es lo que hace que el filtrado no se pueda saltar.
-        # Sin el, el movil solo filtra nombres y las apps con DNS propio escapan.
-        assert not any(
-            p["PayloadType"] == "com.apple.vpn.managed" for p in parsed["PayloadContent"]
-        ), "sin vpn_enabled no debe ir tunel en el perfil"
-
-        # El payload que hace que iOS abra solo la pantalla del codigo. Sin el,
-        # el movil abre una app bloqueada y se queda sin pagina: el DNS lo manda
-        # al VPS, pero no hay certificado para el dominio que pidio.
-        cautivo = [p for p in parsed["PayloadContent"] if p["PayloadType"] == "com.apple.captive-network-support"]
-        assert len(cautivo) == 1
-        assert cautivo[0]["PortalURL"] == "https://app.ejemplo.com/activar"
-        assert cautivo[0]["SupportedURLs"] == ["http://captive.apple.com/hotspot-detect.html"]
-
-
-async def web_scenario():
-    with tempfile.TemporaryDirectory() as directory:
-        config = make_config(directory, captive_ip="203.0.113.7")
-        upstream = FakeUpstream()
-        parts = Components(config)
-        parts.upstream = upstream
-        parts.filter.upstream = upstream
-        # en produccion filtro y portal comparten el mismo Store
-        store = parts.store
-        service = parts.service
-        device = store.add("Recepcion")
-        token = device["token"]
-        with open(config.licenses_file, "w", encoding="utf-8") as handle:
-            json.dump({"ABCD-1234": {"status": "active", "expires_at": int(time.time()) + 86400}}, handle)
-
-        client = TestClient(TestServer(service.build_app()))
-        await client.start_server()
-
-        async def doh(name: str, host: str, qtype: str = "A", ip: str = "88.13.24.7") -> int:
-            wire = DNSRecord.question(name, qtype).pack()
-            response = await client.post(
-                "/dns-query",
-                data=wire,
-                headers={
-                    "Host": host,
-                    "Content-Type": "application/dns-message",
-                    "X-Forwarded-For": ip,
-                },
-            )
-            assert response.status == 200, await response.text()
-            return int(DNSRecord.parse(await response.read()).header.rcode)
-
-        async def doh_a(name: str, host: str, ip: str = "88.13.24.7") -> str:
-            """Resolucion A completa, para ver a donde apunta lo bloqueado."""
-            wire = DNSRecord.question(name, "A").pack()
-            response = await client.post(
-                "/dns-query",
-                data=wire,
-                headers={
-                    "Host": host,
-                    "Content-Type": "application/dns-message",
-                    "X-Forwarded-For": ip,
-                },
-            )
-            reply = DNSRecord.parse(await response.read())
-            for rr in reply.rr:
-                if int(rr.rtype) == 1:
-                    return str(rr.rdata)
-            return ""
-
+    async def request(self, method, path, data=None, headers=None, remote='198.51.100.42'):
+        merged = {'Host': 'portal.example.com', **(headers or {})}
+        if data is not None:
+            merged['Content-Type'] = 'application/json'
+        request = make_mocked_request(method, path, headers=merged).clone(remote=remote)
+        if data is not None:
+            request._read_bytes = json.dumps(data).encode()
         try:
-            assert await doh("youtube.com", f"dev-{token}.dns.ejemplo.com") == int(RCODE.NOERROR)
-            assert await doh("t.me", f"dev-{token}.dns.ejemplo.com") == int(RCODE.NOERROR)
-            assert await doh("app.ejemplo.com", f"dev-{token}.dns.ejemplo.com") == int(RCODE.NOERROR)
-            assert await doh("instagram.com", "dns.ejemplo.com") == int(RCODE.NOERROR)
-            assert await doh("instagram.com", "atacante.example.com") == int(RCODE.NOERROR)
-
-            # lo bloqueado responde con la IP del portal, no con NXDOMAIN
-            assert await doh_a("instagram.com", f"dev-{token}.dns.ejemplo.com") == "203.0.113.7"
-            # el bloqueo permanente no lleva al portal: no se arregla autorizando
-            assert await doh_a("itunes.apple.com", f"dev-{token}.dns.ejemplo.com") == ""
-            assert await doh("itunes.apple.com", f"dev-{token}.dns.ejemplo.com") == int(
-                RCODE.NXDOMAIN
-            )
-            # AAAA se responde sin registros, un "no hay IPv6" normal
-            assert await doh("instagram.com", f"dev-{token}.dns.ejemplo.com", "AAAA") == int(
-                RCODE.NOERROR
-            )
-            assert await doh_a("instagram.com", f"dev-{token}.dns.ejemplo.com") == "203.0.113.7"
-
-            # el movil pide su codigo
-            page = await client.get("/activar/" + token)
-            assert page.status == 200
-            body = await page.text()
-            assert "Recepcion" in body
-            assert "Generar nuevo codigo" in body
-
-            pedido = await client.get(f"/api/pedido/{token}?nuevo=1")
-            assert pedido.status == 200
-            code = (await pedido.json())["codigo"]
-            assert len(code) == 6 and code.isdigit()
-
-            # el codigo no cambia mientras sigue vigente
-            again = await client.get(f"/api/pedido/{token}")
-            assert (await again.json())["codigo"] == code
-
-            # el portal cautivo identifica el equipo por la IP que hizo la consulta
-            mobile_ip = "88.13.24.7"
-            captive = await client.get(
-                "/", headers={"Host": "instagram.com", "X-Forwarded-For": mobile_ip}
-            )
-            assert captive.status == 200
-            captive_body = await captive.text()
-            assert "Recepcion" in captive_body
-            # La pagina es la de siempre: ids de siempre, generacion sola y sin IP.
-            assert code in captive_body
-            for marca in ('id="code"', 'id="code-slots"', 'id="btn-generate"', 'id="estado"'):
-                assert marca in captive_body, marca
-            assert "Generar nuevo codigo" in captive_body
-            assert "Protegida" in captive_body
-            assert 'id="ip-value"' not in captive_body
-            # La IP real no sale en la pagina: por eso pone "Protegida".
-            assert mobile_ip not in captive_body
-            assert "/api/register" in captive_body
-            assert f"equipo='{token}'" in captive_body
-
-            # dos equipos distintos, cada uno con su codigo
-            other_token = store.add("Almacen")["token"]
-            await client.post(
-                "/dns-query",
-                data=DNSRecord.question("instagram.com", "A").pack(),
-                headers={
-                    "Host": f"dev-{other_token}.dns.ejemplo.com",
-                    "Content-Type": "application/dns-message",
-                    "X-Forwarded-For": "88.13.24.8",
-                },
-            )
-            other_code = (
-                await (await client.get(f"/api/pedido/{other_token}?nuevo=1")).json()
-            )["codigo"]
-            assert other_code != code
-            second = await client.get(
-                "/", headers={"Host": "tiktok.com", "X-Forwarded-For": "88.13.24.8"}
-            )
-            second_body = await second.text()
-            assert other_code in second_body
-            assert "Almacen" in second_body
-            assert f"equipo='{other_token}'" in second_body
-
-            # una IP desconocida, con el perfil unico, cae en la pantalla del
-            # codigo: no hay que escribir ninguna referencia
-            stranger = await client.get(
-                "/", headers={"Host": "tiktok.com", "X-Forwarded-For": "1.2.3.4"}
-            )
-            stranger_body = await stranger.text()
-            assert "Generar nuevo codigo" in stranger_body
-            assert "Identifica tu" not in stranger_body
-
-            unknown = await client.get("/", headers={"Host": "instagram.com", "X-Real-Ip": "1.2.3.4"})
-            assert unknown.status == 200
-
-            # el panel solo con la clave de administracion
-            assert (await client.get("/panel")).status == 401
-            panel = await client.get("/panel?k=clave-de-prueba")
-            assert panel.status == 200
-            panel_body = await panel.text()
-            assert f"<code>{code}</code>" in panel_body
-            assert "Recepcion" in panel_body
-            # La clave se incrusta en la pagina: sin esto los botones del navegador
-            # se quedan en 401 no_autorizado, porque la venia en la query.
-            assert "clave='clave-de-prueba'" in panel_body
-            assert 'api("/api/admin/' in panel_body
-            assert 'api("/api/bloquear/' in panel_body
-            assert "clave=''" not in panel_body
-            # Y con la cabecera tambien se abre, con su clave puesta.
-            panel_hdr = await client.get("/panel", headers={"X-Admin-Key": "clave-de-prueba"})
-            assert "clave='clave-de-prueba'" in await panel_hdr.text()
-
-            # rechazar y volver a pedir
-            deny = await client.post(
-                "/api/admin/no",
-                json={"codigo": code},
-                headers={"X-Admin-Key": "clave-de-prueba"},
-            )
-            assert (await deny.json())["ok"] is True
-            assert (await (await client.get(f"/api/pedido/{token}")).json())["codigo"] == ""
-
-            fresh = (await (await client.get(f"/api/pedido/{token}?nuevo=1")).json())["codigo"]
-            assert fresh != code
-
-            # autorizar consume la licencia indicada
-            approve = await client.post(
-                "/api/admin/ok",
-                json={"codigo": fresh, "horas": 2, "licencia": "abcd-1234"},
-                headers={"X-Admin-Key": "clave-de-prueba"},
-            )
-            assert approve.status == 200
-            approved = await approve.json()
-            assert approved["token"] == token
-            assert approved["hours"] == 2
-            assert store.mode(token) == MODE_UNLOCKED
-
-            # una vez autorizado desaparece la solicitud
-            assert (await (await client.get(f"/api/pedido/{token}")).json())["codigo"] == ""
-            assert await doh("instagram.com", f"dev-{token}.dns.ejemplo.com") == int(RCODE.NOERROR)
-            assert await doh_a("itunes.apple.com", f"dev-{token}.dns.ejemplo.com") == ""
-
-            # el movil ve la pantalla de activado, como en la pagina de siempre
-            unlocked_page = await client.get("/activar/" + token)
-            assert "ACTIVADO" in await unlocked_page.text()
-
-            # codigo desconocido
-            missing = await client.post(
-                "/api/admin/ok",
-                json={"codigo": "000000"},
-                headers={"X-Admin-Key": "clave-de-prueba"},
-            )
-            assert missing.status == 404
-
-            # licencia invalida no autoriza
-            other = (await (await client.get(f"/api/pedido/{token}?nuevo=1")).json())["codigo"]
-            bad_lic = await client.post(
-                "/api/admin/ok",
-                json={"codigo": other, "licencia": "NO-EXISTE"},
-                headers={"X-Admin-Key": "clave-de-prueba"},
-            )
-            assert bad_lic.status == 403
-            assert store.mode(token) == MODE_UNLOCKED
-
-            import base64
-
-            wire = DNSRecord.question("youtube.com", "A").pack()
-            get_doh = await client.get(
-                "/dns-query?dns=" + base64.urlsafe_b64encode(wire).decode().rstrip("="),
-                headers={"Host": f"dev-{token}.dns.ejemplo.com"},
-            )
-            assert get_doh.status == 200
-
-            health = await client.get("/salud")
-            assert (await health.json())["ok"] is True
-
-            unauthorized = await client.get(f"/api/estado/{token}")
-            assert unauthorized.status == 401
-            authorized = await client.get(f"/api/estado/{token}?k=clave-de-prueba")
-            assert (await authorized.json())["modo"] == MODE_UNLOCKED
-
-            api_unlock = await client.post(
-                "/api/desbloquear",
-                json={"token": token, "code": "abcd-1234", "hours": 2},
-                headers={"X-Admin-Key": "clave-de-prueba"},
-            )
-            assert (await api_unlock.json())["ok"] is True
-
-            api_bad = await client.post(
-                "/api/desbloquear",
-                json={"token": token, "code": "NO-EXISTE"},
-                headers={"X-Admin-Key": "clave-de-prueba"},
-            )
-            assert api_bad.status == 403
-
-            api_lock = await client.post(
-                f"/api/bloquear/{token}", headers={"X-Admin-Key": "clave-de-prueba"}
-            )
-            assert (await api_lock.json())["unlocked_until"] == 0
-            assert store.mode(token) == MODE_STRICT
-
-            # --- el codigo que genera el movil, como en la web de siempre ---
-            # lo registra la propia pagina y nace pendiente
-            generated = "761204"
-            reg = await client.post(
-                "/api/register",
-                json={"code": generated, "token": token},
-                headers={"X-Forwarded-For": "88.13.24.7"},
-            )
-            assert reg.status == 200
-            assert (await reg.json())["id"] == generated
-            assert (await reg.json())["active"] is False
-
-            # con la IP y el token equivocados no lo acepta
-            assert (
-                await client.post(
-                    "/api/register",
-                    json={"code": "111222", "token": "no-existe"},
-                )
-            ).status == 404
-            assert (await client.post("/api/register", json={"code": "123"})).status == 400
-
-            # el movil consulta su propio estado y solo el suyo
-            state = await client.get(f"/api/estado-codigo/{generated}")
-            assert state.status == 200
-            assert (await state.json())["pending"] is True
-            assert (await (await client.get("/api/estado-codigo/000000")).json())["error"]
-
-            # la lista global no es publica: antes la veia cualquiera
-            assert (await client.get("/api/list")).status == 401
-            listed = await client.get("/api/list?k=clave-de-prueba")
-            assert listed.status == 200
-            assert generated in [c["id"] for c in await listed.json()]
-
-            # el administrador lo autoriza por ese codigo
-            gen_approve = await client.post(
-                "/api/admin/ok",
-                json={"codigo": generated, "horas": 3},
-                headers={"X-Admin-Key": "clave-de-prueba"},
-            )
-            assert gen_approve.status == 200
-            assert (await gen_approve.json())["token"] == token
-            assert store.mode(token) == MODE_UNLOCKED
-            assert (await (await client.get(f"/api/estado-codigo/{generated}")).json())[
-                "active"
-            ] is True
-            # y un codigo que no existe no se puede autorizar
-            assert (
-                await client.post(
-                    "/api/admin/ok",
-                    json={"codigo": "555444"},
-                    headers={"X-Admin-Key": "clave-de-prueba"},
-                )
-            ).status == 404
-
-            # revocar deja de valer sin tocar el resto del equipo
-            revoked = await client.post(
-                "/api/admin/revocar",
-                json={"codigo": generated},
-                headers={"X-Admin-Key": "clave-de-prueba"},
-            )
-            assert (await revoked.json())["ok"] is True
-            after = await (await client.get(f"/api/estado-codigo/{generated}")).json()
-            assert after["active"] is False and after["vencido"] is False
-            assert (
-                await client.post(
-                    "/api/admin/revocar",
-                    json={"codigo": "000000"},
-                    headers={"X-Admin-Key": "clave-de-prueba"},
-                )
-            ).status == 404
-
-            # el panel muestra la seccion de codigos
-            panel_codes = await (await client.get("/panel?k=clave-de-prueba")).text()
-            assert "CODIGOS" in panel_codes
-            assert f"<code>{generated}</code>" in panel_codes
-
-            # --- el generador: un codigo para dejar un iPhone con internet entero ---
-            assert (await client.post("/api/admin/generar", json={"horas": 4})).status == 401
-            made = await client.post(
-                "/api/admin/generar",
-                json={"horas": 8, "cantidad": 2, "dias": 15},
-                headers={"X-Admin-Key": "clave-de-prueba"},
-            )
-            assert made.status == 200
-            generado = await made.json()
-            assert generado["horas"] == 8 and generado["valido_dias"] == 15
-            assert len(generado["codigos"]) == 2
-            code1, code2 = (c["id"] for c in generado["codigos"])
-            assert code1 != code2
-            assert store.mode(token) == MODE_UNLOCKED  # el panel no toca el equipo
-
-            # el movil lo canjea y se queda sin filtro
-            await client.post(f"/api/bloquear/{token}", headers={"X-Admin-Key": "clave-de-prueba"})
-            assert store.mode(token) == MODE_STRICT
-            redeem = await client.post(
-                "/api/canjear",
-                json={"codigo": code1, "token": token},
-                headers={"X-Forwarded-For": "88.13.24.7"},
-            )
-            assert redeem.status == 200
-            redimido = await redeem.json()
-            assert redimido["horas"] == 8 and redimido["token"] == token
-            assert store.mode(token) == MODE_UNLOCKED
-            assert await doh("instagram.com", f"dev-{token}.dns.ejemplo.com") == int(RCODE.NOERROR)
-
-            # un codigo es de un solo uso
-            again = await client.post(
-                "/api/canjear", json={"codigo": code1, "token": token}
-            )
-            assert again.status == 403
-            # y lo que se ve es el estado, no un codigo ajeno
-            assert (await (await client.get(f"/api/estado-codigo/{code1}")).json())["active"] is True
-            assert (await (await client.get(f"/api/estado-codigo/{code2}")).json())["active"] is False
-            # el panel los enseña como generados
-            panel_gen = await (await client.get("/panel?k=clave-de-prueba")).text()
-            assert f"<code>{code1}</code>" in panel_gen
-            assert "GENERADO" in panel_gen and "MOVIL" in panel_gen
-            # el movil ve el boton de canjear
-            assert 'id="entrada"' in await (await client.get("/activar/" + token)).text()
-
-            # codigos mal formados o de otro equipo
-            assert (await client.post("/api/canjear", json={"codigo": "12", "token": token})).status == 400
-            assert (
-                await client.post("/api/canjear", json={"codigo": code2, "token": "nada"})
-            ).status == 404
-
-            profile_denied = await client.get(f"/perfil/{token}.mobileconfig")
-            assert profile_denied.status == 401
-            profile = await client.get(f"/perfil/{token}.mobileconfig?k=clave-de-prueba")
-            assert profile.status == 200
-            assert b"dev-" in await profile.read()
-
-            # --- un unico perfil, valido en cualquier iPhone ---
-            assert (await client.get("/perfil/bloqueoservi.mobileconfig")).status == 401
-            shared = await client.get("/perfil/bloqueoservi.mobileconfig?k=clave-de-prueba")
-            assert shared.status == 200
-            raw_shared = await shared.read()
-            body_shared = plistlib.loads(raw_shared)
-            dns = [
-                p["DNSSettings"] for p in body_shared["PayloadContent"] if p.get("DNSSettings")
-            ][0]
-            # el mismo DoH para todos y sin rastro de ningun token
-            assert dns["DNSServerURLs"] == ["https://app.ejemplo.com/dns-query"]
-            assert token not in raw_shared.decode()
-            assert b"dev-" not in raw_shared
-
-            short = await client.get("/config")
-            assert short.status == 200
-            assert short.headers["Content-Type"].startswith("application/x-apple-aspen-config")
-            assert b"https://app.ejemplo.com/dns-query" in await short.read()
-
-            # Con el perfil comun, este equipo entra por IP, no por token.
-            ip_nueva = "203.0.113.55"
-            otra = "203.0.113.56"
-            comun = "app.ejemplo.com"
-
-            def resuelto(nombre: str, desde: int) -> bool:
-                """Si la consulta llego al resolutor de verdad o la corto el filtro."""
-                return any(c.rstrip(".") == nombre for c in upstream.calls[desde:])
-
-            # /activar es la pantalla que ve el movil: el generador de codigo,
-            # sin pedir ninguna referencia.
-            pantalla = await client.get("/activar", headers={"X-Forwarded-For": ip_nueva})
-            cuerpo = await pantalla.text()
-            assert pantalla.status == 200
-            assert "Generar nuevo c" in cuerpo
-            assert "Identifica tu" not in cuerpo
-            # el movil se genera su codigo, como en la web antigua, y lo registra
-            codigo_movil = "305911"
-            registrado = await client.post(
-                "/api/register",
-                json={"code": codigo_movil},
-                headers={"X-Forwarded-For": ip_nueva},
-            )
-            assert registrado.status == 200
-            assert (await registrado.json())["ip"] == ip_nueva
-            # el panel lo ve pendiente, con su IP, listo para que lo autorices
-            panel = await (await client.get("/panel?k=clave-de-prueba")).text()
-            assert codigo_movil in panel
-            assert ip_nueva in panel
-
-            # tú lo autorizas: ese telefono ya tiene salida
-            ok = await client.post(
-                "/api/admin/ok",
-                json={"codigo": codigo_movil, "horas": 6},
-                headers={"X-Admin-Key": "clave-de-prueba"},
-            )
-            assert ok.status == 200
-            cuerpo_ok = await ok.json()
-            assert cuerpo_ok["ip"] == ip_nueva
-            assert cuerpo_ok["token"] == ""
-            marca = len(upstream.calls)
-            assert await doh("instagram.com", comun, "A", ip_nueva) == int(RCODE.NOERROR)
-            assert resuelto("instagram.com", marca)
-            # y el movil lo ve activo en su pantalla
-            activa = await client.get("/activar", headers={"X-Forwarded-For": ip_nueva})
-            assert "ACTIVADO" in await activa.text()
-            # los tres vetados ni se mueven
-            marca = len(upstream.calls)
-            assert await doh("books.apple.com", comun, "A", ip_nueva) == int(RCODE.NXDOMAIN)
-            assert not any("apple" in c for c in upstream.calls[marca:])
-            # lo dejamos como estaba para seguir probando el canje
-            await client.post(
-                f"/api/admin/ip/{ip_nueva}", headers={"X-Admin-Key": "clave-de-prueba"}
-            )
-
-
-
-            # --- antes del codigo: solo el servicio ---
-            marca = len(upstream.calls)
-            assert await doh("youtube.com", comun, "A", ip_nueva) == int(RCODE.NOERROR)
-            assert not resuelto("youtube.com", marca)
-            assert await doh("t.me", comun, "A", ip_nueva) == int(RCODE.NOERROR)
-            assert not resuelto("t.me", marca)
-            # Instagram responde, pero no se resuelve: le llega la pantalla
-            marca = len(upstream.calls)
-            assert await doh("instagram.com", comun, "A", ip_nueva) == int(RCODE.NOERROR)
-            assert not resuelto("instagram.com", marca)
-            # y los tres vetados ni se intentan
-            marca = len(upstream.calls)
-            assert await doh("books.apple.com", comun, "A", ip_nueva) == int(RCODE.NXDOMAIN)
-            assert await doh("itunes.apple.com", comun, "A", ip_nueva) == int(RCODE.NXDOMAIN)
-            assert not any("apple" in c for c in upstream.calls[marca:])
-
-            # el generador da un codigo y el movil lo canjea
-            hecho = await client.post(
-                "/api/admin/generar",
-                json={"horas": 12},
-                headers={"X-Admin-Key": "clave-de-prueba"},
-            )
-            codigo = (await hecho.json())["codigos"][0]["id"]
-            canje = await client.post(
-                "/api/canjear",
-                json={"codigo": codigo},
-                headers={"X-Forwarded-For": ip_nueva},
-            )
-            assert canje.status == 200
-            assert (await canje.json())["horas"] == 12
-            assert (await canje.json())["ip"] == ip_nueva
-
-            # --- tras el codigo: sale todo menos los tres ---
-            marca = len(upstream.calls)
-            assert await doh("instagram.com", comun, "A", ip_nueva) == int(RCODE.NOERROR)
-            assert resuelto("instagram.com", marca)
-            assert await doh("www.netflix.com", comun, "A", ip_nueva) == int(RCODE.NOERROR)
-            assert resuelto("www.netflix.com", marca)
-            marca = len(upstream.calls)
-            assert await doh("books.apple.com", comun, "A", ip_nueva) == int(RCODE.NXDOMAIN)
-            assert await doh("itunes.apple.com", comun, "A", ip_nueva) == int(RCODE.NXDOMAIN)
-            assert await doh("p01-contactsync.icloud.com", comun, "A", ip_nueva) == int(
-                RCODE.NXDOMAIN
-            )
-            assert not any("apple" in c for c in upstream.calls[marca:])
-
-            # otra IP distinta sigue en el estado de espera
-            marca = len(upstream.calls)
-            assert await doh("instagram.com", comun, "A", otra) == int(RCODE.NOERROR)
-            assert not resuelto("instagram.com", marca)
-            # y el mismo codigo no vale dos veces
-            repetido = await client.post(
-                "/api/canjear", json={"codigo": codigo}, headers={"X-Forwarded-For": otra}
-            )
-            assert repetido.status == 403
-
-            # el panel ve el acceso y lo deja quitar
-            panel_accesos = await (await client.get("/panel?k=clave-de-prueba")).text()
-            assert ip_nueva in panel_accesos
-            assert "ACTIVO" in panel_accesos
-            assert (await client.post(f"/api/admin/ip/{ip_nueva}")).status == 401
-            cortado = await client.post(
-                f"/api/admin/ip/{ip_nueva}", headers={"X-Admin-Key": "clave-de-prueba"}
-            )
-            assert cortado.status == 200
-            # tras revocar, ese telefono vuelve al estado de espera
-            marca = len(upstream.calls)
-            assert await doh("instagram.com", comun, "A", ip_nueva) == int(RCODE.NOERROR)
-            assert not resuelto("instagram.com", marca)
-            marca = len(upstream.calls)
-            assert await doh("youtube.com", comun, "A", ip_nueva) == int(RCODE.NOERROR)
-            assert not resuelto("youtube.com", marca)
-            # y la revocacion sobrevive a un reinicio del servicio
-            assert store.mode_for(None, ip_nueva) == MODE_STRICT
-            assert Store(config.state_file).mode_for(None, ip_nueva) == MODE_STRICT
-
-            # Con el perfil comun la IP es la identidad, asi que no se puede
-            # suplantar: si hay Cloudflare delante manda CF-Connecting-IP, que
-            # Cloudflare sobrescribe, y no el X-Forwarded-For del cliente.
-            generado = await client.post(
-                "/api/admin/generar",
-                json={"horas": 2},
-                headers={"X-Admin-Key": "clave-de-prueba"},
-            )
-            codigo2 = (await generado.json())["codigos"][0]["id"]
-            real = "198.51.100.9"
-            await client.post(
-                "/api/canjear",
-                json={"codigo": codigo2},
-                headers={"CF-Connecting-IP": real, "X-Forwarded-For": "10.0.0.9"},
-            )
-            assert store.mode_for(None, real) == MODE_UNLOCKED
-            # el valor que manda el cliente no abre nada por su cuenta
-            assert store.mode_for(None, "10.0.0.9") == MODE_STRICT
-            await client.post(f"/api/admin/ip/{real}", headers={"X-Admin-Key": "clave-de-prueba"})
-
-            unknown = await client.get("/activar/000000000000")
-            assert "no esta registrado" in await unknown.text()
-
-        finally:
-            await client.close()
-
-
-def test_codes():
-    """El movil genera el codigo, el administrador lo activa y caduca solo."""
-    with tempfile.TemporaryDirectory() as directory:
-        codes = Codes(os.path.join(directory, "codes.json"))
-
-        assert not codes.is_valid("12345")
-        assert not codes.is_valid("abcdef")
-        assert codes.is_valid("000000")
-        assert codes.is_valid(" 483920 ")
-        try:
-            codes.register("12")
-            raise AssertionError("deberia rechazar un codigo corto")
-        except ValueError:
-            pass
-
-        # El movil lo registra; nace pendiente.
-        codes.register("483920", "aabbccddeeff", "203.0.113.9")
-        entry = codes.get("483920")
-        assert entry["active"] is False and entry["pending"] is True
-        assert entry["token"] == "aabbccddeeff" and entry["ip"] == "203.0.113.9"
-        assert entry["expires_at"] == 0
-
-        # Registrar dos veces el mismo codigo no lo duplica ni lo reactiva.
-        codes.register("483920")
-        assert len(codes.list()) == 1
-
-        # El administrador lo activa con una ventana de 2 horas.
-        codes.activate("483920", 2, "panel")
-        entry = codes.get("483920")
-        assert entry["active"] is True and entry["pending"] is False
-        assert entry["activated_by"] == "panel"
-        assert 7100 < entry["expires_at"] - time.time() < 7300
-
-        # Caduca solo, sin que nadie lo toque: se adelanta el reloj en el fichero.
-        codes.activate("483920", 1, "panel")
-        codes._codes["483920"]["expires_at"] = int(time.time()) - 10
-        codes._write()
-        entry = codes.get("483920")
-        assert entry["active"] is False and entry["vencido"] is True
-        assert entry["pending"] is True
-        assert entry["expires_at"] == 0
-
-        # Revocar lo deja pendiente otra vez.
-        codes.activate("483920", 5, "panel")
-        assert codes.revoke("483920") is True
-        entry = codes.get("483920")
-        assert entry["active"] is False and entry["vencido"] is False
-        assert entry["activated_by"] == "" and entry["expires_at"] == 0
-
-        assert codes.get("999999") is None
-        assert codes.activate("999999", 1) is None
-        assert codes.revoke("999999") is False
-
-        # Sobrevive a reiniciar el servicio: se relee del fichero.
-        reopened = Codes(os.path.join(directory, "codes.json"))
-        assert [c["id"] for c in reopened.list()] == ["483920"]
-
-        # No crece sin limite.
-        for number in range(600):
-            codes.register(f"{number:06d}")
-        codes.prune(keep=500)
-        assert len(Codes(os.path.join(directory, "codes.json")).list()) == 500
-        # El mas antiguo es el que se va, y 483920 es de los mas viejos.
-        assert "483920" not in [c["id"] for c in Codes(
-            os.path.join(directory, "codes.json")
-        ).list()]
-
-
-def test_code_generator():
-    """El administrador genera codigos y el movil los canjea una sola vez."""
-    with tempfile.TemporaryDirectory() as directory:
-        codes = Codes(os.path.join(directory, "codes.json"))
-
-        made = codes.generate(6, valid_days=10)
-        assert codes.is_valid(made["id"])
-        assert made["origen"] == "panel"
-        assert made["horas"] == 6
-        assert made["active"] is False and made["usado_at"] == 0
-        assert 864000 - 5 < made["valido_hasta"] - time.time() < 864000 + 5
-
-        # El movil lo canjea y recibe las horas acordadas
-        hours, entry = codes.redeem(made["id"], "aabbccddeeff", "203.0.113.9")
-        assert hours == 6 and entry is not None
-        assert entry["token"] == "aabbccddeeff" and entry["ip"] == "203.0.113.9"
-
-        # No se puede canjear dos veces
-        assert codes.redeem(made["id"], "otro") == (0, None)
-        # Ni un codigo que no existe
-        assert codes.redeem("000000", "aabbccddeeff") == (0, None)
-        # Ni uno que genero el propio movil: ese no se canjea, se autoriza
-        codes.register("555444", "aabbccddeeff")
-        assert codes.redeem("555444", "aabbccddeeff") == (0, None)
-
-        # Caducado para canjear
-        old = codes.generate(3, valid_days=1)
-        codes._codes[old["id"]]["valido_hasta"] = int(time.time()) - 1
-        codes._write()
-        assert codes.redeem(old["id"], "aabbccddeeff") == (0, None)
-
-        # Al activarlo queda marcado como usado y caduca solo
-        codes.activate(made["id"], 6, "canje")
-        entry = codes.get(made["id"])
-        assert entry["active"] is True and entry["usado_at"] > 0
-        assert entry["activated_by"] == "canje"
-        codes._codes[made["id"]]["expires_at"] = int(time.time()) - 1
-        codes._write()
-        entry = codes.get(made["id"])
-        assert entry["active"] is False and entry["vencido"] is True
-        assert entry["origen"] == "panel"
-
-        # Cada codigo generado es distinto
-        ids = {codes.generate(2)["id"] for _ in range(20)}
-        assert len(ids) == 20
-
-
-def test_web():
-    asyncio.run(web_scenario())
-
-
-async def apikey_scenario():
-    """Simula al servidor del cliente activando un codigo con su API key."""
-    with tempfile.TemporaryDirectory() as directory:
-        config = make_config(directory, captive_ip="203.0.113.7")
-        upstream = FakeUpstream()
-        parts = Components(config)
-        parts.upstream = upstream
-        parts.filter.upstream = upstream
-        service = parts.service
-        # un equipo antiguo, que se identifica por token
-        device = parts.store.add("Recepcion")
-        ip = "88.13.24.99"
-
-        client = TestClient(TestServer(service.build_app()))
-        await client.start_server()
-
-        # la pagina genera el codigo y lo registra con la IP del movil
-        code = "761204"
-        generado = await client.post(
-            "/api/register", json={"code": code}, headers={"X-Forwarded-For": ip}
-        )
-        assert generado.status == 200, await generado.text()
-        assert (await generado.json())["active"] is False
-        registro = parts.codes.get(code)
-        assert registro is not None and registro["ip"] == ip
-
-        # sin cabecera no entra
-        r = await client.post("/api/v1/activar", json={"codigo": code})
-        assert r.status == 401, await r.text()
-
-        # con una clave falsa tampoco
-        r = await client.post(
-            "/api/v1/activar", json={"codigo": code}, headers={"X-API-Key": "bsk_live_inventada"}
-        )
-        assert r.status == 403, await r.text()
-
-        # el administrador crea la clave para su servidor
-        entrada, key = parts.api_keys.create("activar", "servidor unlockersserver")
-        assert key.startswith("bsk_live_")
-
-        # el fichero solo guarda el hash, nunca la clave
-        crudo = json.loads(open(parts.api_keys.path, encoding="utf-8").read())
-        assert key not in json.dumps(crudo)
-        assert any(e["id"] == entrada["id"] for e in crudo["keys"])
-
-        # no puede consultar si su permiso es solo activar
-        r = await client.get(f"/api/v1/estado/{code}", headers={"X-API-Key": key})
-        assert r.status == 403, await r.text()
-
-        # si no, la deniega
-        r = await client.post("/api/v1/activar", json={"codigo": "000000"}, headers={"X-API-Key": key})
-        assert r.status == 404, await r.text()
-
-        # y si no, tampoco puede revocar
-        r = await client.post("/api/v1/revocar", json={"codigo": code}, headers={"X-API-Key": key})
-        assert r.status == 403, await r.text()
-
-        # ahora si, con el codigo tal cual lo teclea el usuario
-        r = await client.post(
-            "/api/v1/activar", json={"codigo": code, "horas": 48}, headers={"X-API-Key": key}
-        )
-        assert r.status == 200, await r.text()
-        cuerpo = await r.json()
-        assert cuerpo["ok"] and cuerpo["ip"] == ip
-        assert cuerpo["hours"] == 48  # misma forma de respuesta que el panel
-        assert cuerpo["unlocked_until"] > int(time.time())
-        assert cuerpo["api_key"] == entrada["id"]
-
-        # el movil ya sale: instagram resuelve
-        wire = DNSRecord.question("instagram.com", "A").pack()
-        r = await client.post(
-            "/dns-query",
-            data=wire,
-            headers={"Host": config.portal_host, "X-Forwarded-For": ip,
-                     "Content-Type": "application/dns-message"},
-        )
-        assert int(DNSRecord.parse(await r.read()).header.rcode) == 0
-
-        # la clave queda auditada
-        usados = parts.api_keys.list()[0]
-        assert usados["uses"] >= 2 and usados["last_used_at"] > 0
-
-        # con permiso de consultar, ahora si lee el estado
-        _, key_consulta = parts.api_keys.create("consultar", "consulta")
-        r = await client.get(f"/api/v1/estado/{code}", headers={"X-API-Key": key_consulta})
-        assert r.status == 200, await r.text()
-        estado = await r.json()
-        assert estado["id"] == code
-        assert estado["active"] is True and estado["activated_by"] == "api"
-        assert estado["ip"] == ip
-
-        # Un codigo puede tener token (equipo antiguo) E IP (perfil unico). Antes
-        # solo se abria una de las dos: la API decia ok y el movil seguia igual.
-        mixto = parts.codes.register("445566", token=device["token"], ip=ip)
-        assert mixto["token"] == device["token"] and mixto["ip"] == ip
-        r = await client.post(
-            "/api/v1/activar", json={"codigo": "445566", "horas": 12}, headers={"X-API-Key": key}
-        )
-        assert r.status == 200, await r.text()
-        cuerpo = await r.json()
-        assert cuerpo["token"] == device["token"] and cuerpo["ip"] == ip
-        assert len(cuerpo["abierto"]) == 2
-        # las dos identidades quedan abiertas
-        assert parts.store.mode(device["token"]) == MODE_UNLOCKED
-        assert parts.store.mode_for("", ip) == MODE_UNLOCKED
-
-        # revocar la clave corta el acceso al instante
-        assert parts.api_keys.revoke(entrada["id"])
-        r = await client.post(
-            "/api/v1/activar", json={"codigo": code}, headers={"X-API-Key": key}
-        )
-        assert r.status == 403, await r.text()
-
-
-def test_apikeys():
-    asyncio.run(apikey_scenario())
-
-
-TESTS = [
-    test_rules,
-    test_policy_lists,
-    test_config_tokens,
-    test_store_and_licenses,
-    test_filter,
-    test_profile,
-    test_codes,
-    test_code_generator,
-    test_web,
-    test_apikeys,
-]
-
-
-def main() -> int:
-    failures = 0
-    for test in TESTS:
-        try:
-            test()
-            print(f"ok   {test.__name__}")
-        except Exception as exc:
-            failures += 1
-            print(f"FAIL {test.__name__}: {type(exc).__name__}: {exc}")
-            import traceback
-
-            traceback.print_exc()
-    print(f"\n{len(TESTS) - failures}/{len(TESTS)} pruebas correctas")
-    return 1 if failures else 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+            return await self.app._handle(request)
+        except web.HTTPException as response:
+            return response
+
+
+def body(response):
+    return json.loads(response.body)
+
+
+class StateTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.config = configuration(self.temp.name)
+        self.parts = Components(self.config)
+        self.store = self.parts.store
+
+    def test_identity_and_legacy_migration(self):
+        device = self.store.add('Phone')
+        self.assertEqual(len(device['token']), 48)
+        self.assertTrue(device['profile_uuid'])
+        self.assertEqual(self.store.state(device['token']), 'RESTRICTED')
+        old = {'devices': {'aabbccddeeff': {'label': 'Old', 'unlocked_until': int(time.time()) + 500}}, 'ips': {}}
+        legacy = Path(self.temp.name) / 'old.json'
+        legacy.write_text(json.dumps(old))
+        store = Store(str(legacy))
+        self.assertEqual(store.mode('aabbccddeeff'), MODE_UNLOCKED)
+        store.add('New')
+        self.assertEqual(Store(str(legacy)).device('aabbccddeeff')['label'], 'Old')
+
+    def test_expiry_revocation_and_reauthorization(self):
+        token = self.store.add()['token']
+        self.store.unlock(token, '', 1)
+        self.assertEqual(self.store.state(token), 'UNLOCKED')
+        self.store.set_unlocked_until(token, int(time.time()) - 1)
+        self.assertEqual(self.store.state(token), 'EXPIRED')
+        self.store.revoke_credential(token)
+        self.assertEqual(Store(self.config.state_file).state(token), 'REVOKED')
+        with self.assertRaises(ValueError):
+            self.store.unlock(token, '', 1)
+        self.store.set_unlocked_until(token, int(time.time()) + 100)
+        self.assertEqual(self.store.mode(token), MODE_STRICT)
+
+    def test_invalid_hours(self):
+        token = self.store.add()['token']
+        for hours in (0, -1, 2161):
+            with self.assertRaises(ValueError):
+                self.store.unlock(token, '', hours)
+
+    def test_concurrent_store_instances(self):
+        def add(i):
+            return Store(self.config.state_file).add(str(i))['token']
+        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+            tokens = list(pool.map(add, range(30)))
+        self.assertEqual(len(set(tokens)), 30)
+        self.assertEqual(len(self.store.list()), 30)
+        self.assertEqual(os.stat(self.config.state_file).st_mode & 0o777, 0o600)
+
+    def test_cross_process_writes(self):
+        script = 'import sys; from blockservi.store import Store; s=Store(sys.argv[1]); [s.add() for _ in range(5)]'
+        processes = [subprocess.Popen([sys.executable, '-c', script, self.config.state_file], cwd=ROOT) for _ in range(2)]
+        for process in processes:
+            self.assertEqual(process.wait(timeout=15), 0)
+        self.assertEqual(len(self.store.list()), 10)
+
+    def test_codes_one_use_under_concurrency(self):
+        code = self.parts.codes.generate(3)['id']
+        def redeem(i):
+            return Codes(self.parts.codes.path).redeem(code, f'token{i}')[0]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
+            results = list(pool.map(redeem, range(12)))
+        self.assertEqual(sum(bool(value) for value in results), 1)
+
+    def test_code_ownership(self):
+        codes = self.parts.codes
+        codes.register('123456', 'owner', '198.51.100.1')
+        with self.assertRaises(ValueError):
+            codes.register('123456', 'attacker', '198.51.100.1')
+        self.assertFalse(codes.bind('123456', 'attacker'))
+        generated = codes.generate(1)['id']
+        with self.assertRaises(ValueError):
+            codes.register(generated, 'attacker')
+
+    def test_licenses_and_api_scopes(self):
+        Path(self.config.licenses_file).write_text(json.dumps({'OK': {'status': 'active'}, 'NO': {'status': 'revoked'}}))
+        self.assertTrue(self.parts.licenses.check('ok').ok)
+        self.assertFalse(self.parts.licenses.check('NO').ok)
+        entry, key = self.parts.api_keys.create('activar')
+        self.assertNotIn(key, Path(self.parts.api_keys.path).read_text())
+        self.assertIsNotNone(self.parts.api_keys.verify(key, 'activar'))
+        self.assertIsNone(self.parts.api_keys.verify(key, 'revocar'))
+        self.parts.api_keys.revoke(entry['id'])
+        self.assertIsNone(self.parts.api_keys.verify(key))
+
+    def test_persistent_limiter(self):
+        for _ in range(3):
+            self.assertTrue(VirtualState(self.temp.name).allow('dummy', 3))
+        self.assertFalse(VirtualState(self.temp.name).allow('dummy', 3))
+
+    def test_policy_lists_and_essential_services(self):
+        policy = self.parts.policy
+        for name in ('youtube.com', 'r1.googlevideo.com', *SYSTEM_ESSENTIAL):
+            self.assertTrue(policy.decide(name, MODE_STRICT).allow, name)
+        for name in ('t.me', 'telegram.org', 'cdn-telegram.org', 'messenger.com', 'whatsapp.net', 'facebook.com', 'instagram.com', 'threads.com'):
+            self.assertFalse(policy.decide(name, MODE_STRICT).allow, name)
+            self.assertTrue(policy.decide(name, MODE_UNLOCKED).allow, name)
+        self.assertFalse(policy.decide('example.net', MODE_STRICT).allow)
+        self.assertTrue(policy.decide('example.net', MODE_UNLOCKED).allow)
+        self.assertFalse(policy.decide('dns.google', MODE_UNLOCKED).allow)
+        old = Policy({'deny_always': ['icloud.com', 'ls.apple.com']})
+        self.assertTrue(old.decide('p72-fmip.icloud.com', MODE_STRICT).allow)
+        self.assertTrue(Policy({'strict_push': True, 'allow_strict_optional': ['push.example']}).decide('push.example', MODE_STRICT).allow)
+        self.assertFalse(Policy({'allow_strict': ['bad.example'], 'deny_strict': ['bad.example']}).decide('bad.example', MODE_STRICT).allow)
+        self.assertIsNotNone(Policy({'blocked_qtypes': ['AAAA']}).check_qtype('AAAA'))
+
+    def test_dns_profile_schema_and_unique_ids(self):
+        devices = [self.store.add() for _ in range(2)]
+        profiles = [plistlib.loads(build_profile(self.config, d['token'], profile_uuid=d['profile_uuid'])) for d in devices]
+        ids = []
+        for profile, device in zip(profiles, devices):
+            self.assertEqual(profile['PayloadUUID'], device['profile_uuid'])
+            dns = profile['PayloadContent'][0]['DNSSettings']
+            self.assertEqual(dns, {'DNSProtocol': 'HTTPS', 'ServerURL': f'https://portal.example.com/dns-query/{device["token"]}'})
+            self.assertNotIn('SCEP', str(profile))
+            self.assertNotIn(self.config.admin_key, str(profile))
+            ids += [profile['PayloadUUID'], *[p['PayloadUUID'] for p in profile['PayloadContent']]]
+        self.assertEqual(len(ids), len(set(ids)))
+
+    def test_optional_wifi(self):
+        token = self.store.add()['token']
+        profile = plistlib.loads(build_profile(self.config, token, wifi={'ssid': 'Office', 'security': 'WPA2', 'password': 'dummy-password', 'auto_join': False}))
+        wifi = profile['PayloadContent'][-1]
+        self.assertEqual(wifi['EncryptionType'], 'WPA2')
+        self.assertFalse(wifi['AutoJoin'])
+        with self.assertRaises(ValueError):
+            build_profile(self.config, token, wifi={'ssid': 'Office', 'security': 'WEP'})
+
+    def test_certificates_and_offline_profile(self):
+        ca = Authority.initialize(str(Path(self.temp.name) / 'ca'))
+        tokens = [self.store.add()['token'] for _ in range(2)]
+        config = dataclasses.replace(self.config, vpn_enabled=True, vpn_address='vpn.example.com', vpn_remote='vpn.example.com', doh_server_addresses=('203.0.113.10',))
+        Path(config.vpn_ca_file).write_bytes(ca.cert.public_bytes(__import__('cryptography').hazmat.primitives.serialization.Encoding.DER))
+        identities = []
+        for token in tokens:
+            ca.provision(token, config.credentials_dir, os.getuid(), os.getgid())
+            identity = json.loads((Path(config.credentials_dir) / (token + '.json')).read_text())
+            identities.append(identity)
+            key, cert, chain = pkcs12.load_key_and_certificates(base64.b64decode(identity['pkcs12']), identity['password'].encode())
+            self.assertIsNotNone(key)
+            cert.verify_directly_issued_by(ca.cert)
+            self.assertEqual(cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value.get_values_for_type(x509.DNSName), [token + '.iblocker.invalid'])
+            profile = plistlib.loads(build_profile(config, token))
+            payloads = profile['PayloadContent']
+            self.assertEqual(len(payloads), 4)
+            self.assertEqual(payloads[-1]['IKEv2']['PayloadCertificateUUID'], payloads[1]['PayloadUUID'])
+            self.assertEqual(payloads[-1]['IKEv2']['AuthenticationMethod'], 'Certificate')
+            self.assertNotIn('AuthPassword', payloads[-1]['IKEv2'])
+            self.assertEqual(payloads[-1]['IKEv2']['IncludeAllNetworks'], 1)
+            self.assertNotIn('OnDemandEnabled', payloads[-1])
+            self.assertEqual(payloads[-1]['DNS']['ServerAddresses'], ['203.0.113.10'])
+        self.assertNotEqual(identities[0]['serial'], identities[1]['serial'])
+        self.assertNotEqual(identities[0]['password'], identities[1]['password'])
+        crl_path = str(Path(self.temp.name) / 'revoked.der')
+        ca.crl(set(tokens), {tokens[0]}, crl_path)
+        crl = x509.load_der_x509_crl(Path(crl_path).read_bytes())
+        self.assertIsNotNone(crl.get_revoked_certificate_by_serial_number(int(identities[0]['serial'])))
+        self.assertIsNone(crl.get_revoked_certificate_by_serial_number(int(identities[1]['serial'])))
+        with self.assertRaises(ValueError):
+            Authority.initialize(str(Path(self.temp.name) / 'ca'))
+
+    def test_firewall_policy_by_internal_identity(self):
+        a, b = [self.store.add()['token'] for _ in range(2)]
+        self.store.unlock(a, '', 1)
+        sessions = [{'token': a, 'reqid': 1, 'virtual_ips': ['10.77.0.1'], 'public_ip': '198.51.100.42'},
+                    {'token': b, 'reqid': 2, 'virtual_ips': ['10.77.0.2'], 'public_ip': '198.51.100.42'}]
+        spec = {'pool4': '10.77.0.0/24', 'pool6': 'fd77:77::/120', 'portal_ips': ['203.0.113.10'], 'deny_networks': ['192.168.0.0/16']}
+        rules = render_rules(self.store, sessions, spec, [], self.parts.policy)
+        self.assertIn('ip saddr 10.77.0.1 ipsec in reqid 1', rules)
+        self.assertIn('ip saddr 10.77.0.2 ipsec in reqid 2', rules)
+        self.assertIn('10.77.0.1 timeout 15s', rules)
+        self.assertNotIn('10.77.0.2 timeout', rules)
+        self.assertNotIn('198.51.100.42', rules)
+        self.assertNotIn('ct state established,related accept', rules)
+        self.store.revoke_credential(a)
+        closed = render_rules(self.store, sessions, spec, [], self.parts.policy)
+        self.assertNotIn('ip saddr 10.77.0.1 ipsec in reqid 1', closed)
+        self.assertNotIn('10.77.0.1 timeout', closed)
+        self.assertIn('hook forward priority -20', closed)
+
+    def test_vici_parser_and_counter(self):
+        token = self.store.add()['token']
+        fixture = {'iblocker': {'state': b'ESTABLISHED', 'remote-id': (token+'.iblocker.invalid').encode(),
+                   'remote-host': b'198.51.100.42', 'uniqueid': b'17', 'remote-vips': [b'10.77.0.1'],
+                   'child-sas': {'internet-1': {'state': b'INSTALLED', 'reqid': b'8', 'bytes-in': b'123'}}}}
+        sessions = sessions_from_vici([fixture])
+        self.assertEqual(sessions[0]['token'], token)
+        self.assertEqual(sessions[0]['bytes_in'], 123)
+        self.assertEqual(sessions[0]['reqid'], 8)
+
+    def test_limiter_windows_do_not_reset_other_keys(self):
+        state = VirtualState(self.temp.name)
+        with patch('blockservi.virtual.time.time', return_value=10000):
+            self.assertTrue(state.allow('login', 1, 900))
+        with patch('blockservi.virtual.time.time', return_value=10100):
+            self.assertTrue(state.allow('poll', 120, 60))
+            self.assertFalse(state.allow('login', 1, 900))
+        with patch('blockservi.virtual.time.time', return_value=10901):
+            self.assertTrue(state.allow('login', 1, 900))
+
+    def test_license_limits_effective_authorization(self):
+        now = int(time.time())
+        Path(self.config.licenses_file).write_text(json.dumps({'SHORT': {'status': 'active', 'expires_at': now+10}}))
+        token = self.store.add()['token']
+        self.store.unlock(token, 'SHORT', 24)
+        self.assertEqual(self.store.effective_until(token), now+10)
+        Path(self.config.licenses_file).write_text(json.dumps({'SHORT': {'status': 'revoked'}}))
+        self.assertEqual(self.store.mode(token), MODE_STRICT)
+        self.store.unlock(token, '', 1)
+        self.assertEqual(self.store.mode(token), MODE_UNLOCKED)
+
+    def test_firewall_learns_only_allowed_public_destinations(self):
+        spec = {'pool4': '10.77.0.0/24', 'pool6': 'fd77:77::/120', 'portal_ips': ['203.0.113.10']}
+        now = int(time.time())
+        answers = [('youtube.com', '8.8.4.4', now+30), ('youtube.com','127.0.0.1',now+30),
+                   ('example.net','9.9.9.9',now+30),('youtube.com','1.1.1.1',now-1)]
+        rules = render_rules(self.store, [], spec, answers, self.parts.policy, now)
+        self.assertIn('allowed4 { 8.8.4.4 timeout 30s }', rules)
+        self.assertNotIn('9.9.9.9', rules)
+        self.assertNotIn('1.1.1.1', rules)
+        self.assertNotIn('127.0.0.1', rules)
+
+
+
+class AsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.config = configuration(self.temp.name)
+        self.parts = Components(self.config)
+        self.parts.filter.upstream = Resolver()
+        self.client = Client(self.parts.service.build_app())
+        self.admin = {'X-Admin-Key': self.config.admin_key}
+        self.a, self.b = [self.parts.store.add()['token'] for _ in range(2)]
+
+    async def call(self, method, path, data=None, headers=None, **kwargs):
+        return await self.client.request(method, path, data, headers, **kwargs)
+
+    async def test_admin_auth_and_no_secret_in_html(self):
+        self.assertEqual((await self.call('GET', '/api/virtual/devices?k=test-admin-only')).status, 401)
+        response = await self.call('GET', '/panel', headers=self.admin)
+        self.assertEqual(response.status, 200)
+        self.assertNotIn(self.config.admin_key, response.text)
+        self.assertIn('IBLOKER VIRTUAL', response.text)
+        self.assertNotIn('Math.random', device_page({}, self.a))
+        self.assertNotIn('?k=', response.text)
+
+    async def test_session_cookie_and_csrf(self):
+        response = await self.call('POST', '/login', {'key': self.config.admin_key})
+        self.assertEqual(response.status, 200)
+        morsel = response.cookies['iblocker_session']
+        self.assertTrue(morsel['secure'])
+        self.assertTrue(morsel['httponly'])
+        cookie = {'Cookie': f'iblocker_session={morsel.value}'}
+        self.assertEqual((await self.call('GET', '/api/virtual/devices', headers=cookie)).status, 200)
+        self.assertEqual((await self.call('POST', '/api/virtual/devices', {'label': 'X'}, cookie)).status, 401)
+        cookie['X-IBLOKER-Request'] = '1'
+        self.assertEqual((await self.call('POST', '/api/virtual/devices', {'label': 'X'}, cookie)).status, 201)
+        cookie['Origin'] = 'https://attacker.example'
+        self.assertEqual((await self.call('POST', '/api/virtual/devices', {}, cookie)).status, 403)
+
+    async def test_ip_headers_require_trusted_proxy(self):
+        request = make_mocked_request('GET', '/', headers={'CF-Connecting-IP': '192.0.2.100', 'X-Forwarded-For': '192.0.2.200'}).clone(remote='198.51.100.42')
+        self.assertEqual(self.parts.service._peer_ip(request), '198.51.100.42')
+        proxied = request.clone(remote='127.0.0.1', headers={'X-Forwarded-For': '192.0.2.100, 198.51.100.42'})
+        self.assertEqual(self.parts.service._peer_ip(proxied), '198.51.100.42')
+
+    async def test_same_public_ip_authorization_and_revocation(self):
+        response = await self.call('GET', f'/api/pedido/{self.a}?nuevo=1')
+        code = body(response)['codigo']
+        response = await self.call('POST', '/api/admin/ok', {'codigo': code, 'horas': 2}, self.admin)
+        self.assertEqual(response.status, 200, response.text)
+        self.assertEqual(self.parts.store.mode(self.a), MODE_UNLOCKED)
+        self.assertEqual(self.parts.store.mode(self.b), MODE_STRICT)
+        self.assertEqual(self.parts.store.mode_for('', '198.51.100.42'), MODE_STRICT)
+        response = await self.call('POST', '/api/admin/revocar', {'codigo': code}, self.admin)
+        self.assertEqual(response.status, 200)
+        self.assertEqual(self.parts.store.mode(self.a), MODE_STRICT)
+
+    async def test_concurrent_approval_and_replay(self):
+        code = body(await self.call('GET', f'/api/pedido/{self.a}?nuevo=1'))['codigo']
+        results = await asyncio.gather(*[self.call('POST', '/api/admin/ok', {'codigo': code}, self.admin) for _ in range(4)])
+        self.assertEqual(sorted(r.status for r in results), [200, 409, 409, 409])
+        self.assertEqual(self.parts.store.device(self.a)['unlock_count'], 1)
+
+    async def test_redeem_and_revoke_api(self):
+        code = self.parts.codes.generate(1)['id']
+        response = await self.call('POST', '/api/canjear', {'codigo': code, 'token': self.a})
+        self.assertEqual(response.status, 200)
+        response = await self.call('POST', '/api/canjear', {'codigo': code, 'token': self.b})
+        self.assertEqual(response.status, 403)
+        _, key = self.parts.api_keys.create('revocar')
+        response = await self.call('POST', '/api/v1/revocar', {'codigo': code}, {'X-API-Key': key})
+        self.assertEqual(response.status, 200)
+        self.assertEqual(self.parts.store.mode(self.a), MODE_STRICT)
+
+    async def test_external_api_scope_and_activation(self):
+        code = body(await self.call('GET', f'/api/pedido/{self.a}?nuevo=1'))['codigo']
+        _, key = self.parts.api_keys.create('consultar')
+        self.assertEqual((await self.call('POST', '/api/v1/activar', {'codigo': code}, {'X-API-Key': key})).status, 403)
+        _, key = self.parts.api_keys.create('activar')
+        response = await self.call('POST', '/api/v1/activar', {'codigo': code}, {'X-API-Key': key})
+        self.assertEqual(response.status, 200)
+        self.assertEqual(self.parts.store.mode(self.a), MODE_UNLOCKED)
+        self.assertEqual(self.parts.store.mode_for('', '198.51.100.99'), MODE_STRICT)
+
+    async def test_code_state_ownership(self):
+        code = body(await self.call('GET', f'/api/pedido/{self.a}?nuevo=1'))['codigo']
+        self.assertEqual((await self.call('GET', '/api/estado-codigo/'+code)).status, 404)
+        self.assertEqual((await self.call('GET', '/api/estado-codigo/'+code, headers={'X-Device-Token': self.b})).status, 404)
+        response = await self.call('GET', '/api/estado-codigo/'+code, headers={'X-Device-Token': self.a})
+        self.assertEqual(response.status, 200)
+        self.assertNotIn('token', body(response))
+
+    async def test_revoke_credential_blocks_dns_and_profile(self):
+        await self.call('POST', f'/api/virtual/devices/{self.a}/revoke', {}, self.admin)
+        self.assertEqual((await self.call('GET', '/perfil/'+self.a+'.mobileconfig', headers=self.admin)).status, 403)
+        self.assertEqual((await self.call('GET', f'/api/pedido/{self.a}?nuevo=1')).status, 403)
+        wire = DNSRecord.question('youtube.com').pack()
+        reply = await self.parts.filter.handle(wire, self.a, '198.51.100.42')
+        self.assertEqual(DNSRecord.parse(reply).header.rcode, RCODE.REFUSED)
+
+    async def test_dns_state_before_cache_and_no_ip_leak(self):
+        wire = DNSRecord.question('example.net').pack()
+        self.parts.store.unlock_ip('198.51.100.42', '', 2)
+        restricted = await self.parts.filter.handle(wire, self.b, '198.51.100.42')
+        self.assertEqual(DNSRecord.parse(restricted).header.rcode, RCODE.NXDOMAIN)
+        self.parts.store.unlock(self.a, '', 1)
+        self.assertEqual(DNSRecord.parse(await self.parts.filter.handle(wire, self.a)).header.rcode, 0)
+        self.parts.store.set_unlocked_until(self.a, int(time.time()) - 1)
+        self.assertEqual(DNSRecord.parse(await self.parts.filter.handle(wire, self.a)).header.rcode, RCODE.NXDOMAIN)
+        empty = DNSRecord(DNSHeader()).pack()
+        self.assertEqual(DNSRecord.parse(await self.parts.filter.handle(empty, None)).header.rcode, RCODE.FORMERR)
+        self.assertIsNone(await self.parts.filter.handle(b'bad', None))
+
+    async def test_doh_route_and_answers_learning(self):
+        wire = DNSRecord.question('youtube.com').pack()
+        encoded = base64.urlsafe_b64encode(wire).decode().rstrip('=')
+        response = await self.call('GET', '/dns-query/'+self.a+'?dns='+encoded)
+        self.assertEqual(response.status, 200)
+        self.assertEqual(DNSRecord.parse(response.body).header.rcode, 0)
+        self.assertTrue(self.parts.virtual.answers())
+        self.assertEqual((await self.call('GET', '/api/virtual/devices')).status, 401)
+
+    async def test_profile_and_provisioning_status(self):
+        response = await self.call('GET', '/perfil/'+self.a+'.mobileconfig', headers=self.admin)
+        self.assertEqual(response.status, 200)
+        self.assertEqual(plistlib.loads(response.body)['PayloadDisplayName'], 'IBLOKER')
+        self.assertEqual((await self.call('GET', '/config')).status, 410)
+        response = await self.call('GET', '/api/virtual/devices', headers=self.admin)
+        self.assertFalse(body(response)['controller']['healthy'])
+
+    async def test_rejected_code_cannot_be_approved(self):
+        code = body(await self.call('GET', f'/api/pedido/{self.a}?nuevo=1'))['codigo']
+        self.assertEqual((await self.call('POST', '/api/admin/no', {'codigo': code}, self.admin)).status, 200)
+        self.assertEqual((await self.call('POST', '/api/admin/ok', {'codigo': code}, self.admin)).status, 409)
+        self.assertEqual(self.parts.store.mode(self.a), MODE_STRICT)
+
+    async def test_request_collision_does_not_rebind_existing_code(self):
+        self.parts.codes.register('123456', self.b, '198.51.100.42')
+        with patch.object(self.parts.store, '_new_request_code', side_effect=['123456', '234567']):
+            response = await self.call('GET', f'/api/pedido/{self.a}?nuevo=1')
+        self.assertEqual(response.status, 200)
+        self.assertEqual(body(response)['codigo'], '234567')
+        self.assertEqual(self.parts.codes.get('123456')['token'], self.b)
+
+    async def test_image_workflow_individual_approval(self):
+        response = await self.call('GET', f'/api/pedido/{self.a}?nuevo=1')
+        code = body(response)['codigo']
+        self.assertRegex(code, r'^[0-9]{6}$')
+        response = await self.call('POST', '/api/admin/ok', {'codigo': code, 'horas': 1, 'individual_only': True}, self.admin)
+        self.assertEqual(response.status, 200)
+        self.assertEqual(self.parts.store.mode(self.a), MODE_UNLOCKED)
+        self.assertEqual(self.parts.store.mode(self.b), MODE_STRICT)
+        unbound = self.parts.codes.generate(1)['id']
+        response = await self.call('POST', '/api/admin/ok', {'codigo': unbound, 'individual_only': True}, self.admin)
+        self.assertEqual(response.status, 403)
+
+    async def test_invalid_json_and_duration(self):
+        self.assertEqual((await self.call('POST', '/api/virtual/devices', [], self.admin)).status, 400)
+        self.assertEqual((await self.call('POST', f'/api/virtual/devices/{self.a}/unlock', {'hours': -1}, self.admin)).status, 400)
+        code = body(await self.call('GET', f'/api/pedido/{self.a}?nuevo=1'))['codigo']
+        _, key = self.parts.api_keys.create('activar')
+        self.assertEqual((await self.call('POST', '/api/v1/activar', {'codigo': code, 'ip': '198.51.100.99'}, {'X-API-Key': key})).status, 400)
+        self.assertEqual(self.parts.store.mode(self.a), MODE_STRICT)
+
+    async def test_persistent_redeem_rate_limit(self):
+        for _ in range(10):
+            response = await self.call('POST', '/api/canjear', {'codigo': '000000', 'token': self.a})
+            self.assertEqual(response.status, 403)
+        self.assertEqual((await self.call('POST', '/api/canjear', {'codigo': '000000', 'token': self.a})).status, 429)
+
+    async def test_upstream_cache_expiry_ttl_and_inflight(self):
+        upstream = Upstream((), (), cache_ttl=5)
+        calls = []
+        async def forward(request, wire):
+            calls.append(1)
+            await asyncio.sleep(0)
+            return await Resolver().resolve(wire)
+        upstream._forward = forward
+        a, b = DNSRecord.question('test.example'), DNSRecord.question('test.example')
+        a.header.id, b.header.id = 1, 2
+        replies = await asyncio.gather(upstream.resolve(a.pack()), upstream.resolve(b.pack()))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual([DNSRecord.parse(r).header.id for r in replies], [1, 2])
+        self.assertLessEqual(upstream._cache_ttl_for(replies[0]), 5)
+        original = time.monotonic()
+        with patch('blockservi.upstream.time.monotonic', return_value=original + 2):
+            cached = await upstream.resolve(a.pack())
+            self.assertLess(DNSRecord.parse(cached).rr[0].ttl, 30)
+        a.header.cd = 1
+        await upstream.resolve(a.pack())
+        self.assertEqual(len(calls), 2)
+        reply = DNSRecord.parse(replies[0]); reply.rr[0].ttl = 0
+        self.assertEqual(upstream._cache_ttl_for(reply.pack()), 0)
+        mismatch = DNSRecord.question('wrong.example').reply().pack()
+        with self.assertRaises(UpstreamError):
+            upstream._check_matching(mismatch, b.pack())
+
+    async def test_upstream_failure_and_duplicate_questions(self):
+        async def failed(wire):
+            raise UpstreamError('fixture failure')
+        self.parts.filter.upstream.resolve = failed
+        wire = DNSRecord.question('youtube.com').pack()
+        reply = await self.parts.filter.handle(wire, self.a)
+        self.assertEqual(DNSRecord.parse(reply).header.rcode, RCODE.SERVFAIL)
+        query = DNSRecord.question('youtube.com');query.questions.append(query.q)
+        self.assertEqual(DNSRecord.parse(await self.parts.filter.handle(query.pack(), self.a)).header.rcode, RCODE.FORMERR)
+        log = Path(self.config.log_file).read_text()
+        self.assertNotIn(self.a, log)
+
+
+if __name__ == '__main__':
+    unittest.main(verbosity=2)

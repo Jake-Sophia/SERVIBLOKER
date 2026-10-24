@@ -1,0 +1,30 @@
+@startuml
+title Motor DNS integrado
+participant "iPhone / DoH" as I
+participant "web / PlainBridge" as W
+participant Filter as F
+participant Store as S
+participant Policy as P
+participant Upstream as U
+database QueryLog as L
+database "VirtualState.answers" as A
+I -> W: DNS wire (ruta token u host antiguo)
+W -> F: handle(wire, token, IP observada)
+F -> F: parse / QR / una pregunta / QTYPE
+F -> S: estado efectivo / licencia / revocación
+alt identidad revocada
+F --> W: REFUSED
+else identidad válida o sin identidad
+F -> P: check_qtype / esenciales / deny_always
+modo / deny_strict / allow_strict / opcionales
+alt dominio bloqueado
+F -> L: bloqueo con identidad hash
+F --> W: NXDOMAIN, REFUSED o cautivo configurado
+else permitido
+F -> U: resolve (caché TTL e inflight)
+U --> F: DNS o UpstreamError
+F -> A: aprender A/AAAA de dominios permitidos en RESTRICTED
+F --> W: respuesta o SERVFAIL
+end
+end
+@enduml

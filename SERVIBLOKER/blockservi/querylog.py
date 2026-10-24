@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import threading
 import time
@@ -37,7 +38,7 @@ class QueryLog:
         entry = {
             "at": int(time.time()),
             "kind": kind,
-            "device": device,
+            "device": hashlib.sha256(device.encode()).hexdigest()[:16] if device != "-" else "-",
             "mode": mode,
             "name": name,
             "qtype": qtype,

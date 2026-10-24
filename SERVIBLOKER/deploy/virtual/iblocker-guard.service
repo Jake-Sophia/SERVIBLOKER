@@ -1,0 +1,14 @@
+[Unit]
+Description=IBLOKER closed firewall before IKEv2 accepts clients
+Before=strongswan.service iblocker-controller.service
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=true
+WorkingDirectory=/opt/blockservi
+ExecStart=/opt/blockservi/.venv/bin/python -m blockservi.controller --config /etc/blockservi/blockservi.ini --firewall /etc/blockservi/firewall.json --ca-dir /var/lib/iblocker-pki --guard-only
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

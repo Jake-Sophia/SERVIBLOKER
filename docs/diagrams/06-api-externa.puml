@@ -1,0 +1,20 @@
+@startuml
+title Autorización y revocación por API
+actor "Servidor del operador" as A
+participant "Service + ApiKeys" as W
+database Codes as C
+database Store as S
+participant "Controlador root" as V
+A -> W: X-API-Key + scope activar
+W -> W: validar permiso / licencia / horas
+W -> C: bajo flock: verificar no usado/revocado
+W -> C: consumir código
+W -> S: unlock token; IP sólo legado SIN token
+W --> A: identidad y vencimiento efectivo
+V -> S: reconciliar autorización
+A -> W: X-API-Key scope revocar
+W -> C: revoke
+W -> S: set_unlocked_until = 0 de su identidad
+note over C,S: JSON separados: interrupción tras consumo
+puede requerir autorización directa del equipo.
+@enduml

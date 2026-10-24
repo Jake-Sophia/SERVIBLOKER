@@ -9,6 +9,8 @@ import threading
 import time
 from typing import Any
 
+from .persistence import serialized, write_json
+
 # Permisos. "*" da todo, que es lo que lleva la clave de administracion.
 SCOPE_ACTIVAR = "activar"
 SCOPE_CONSULTAR = "consultar"
@@ -44,7 +46,7 @@ class ApiKeys:
     def reload(self) -> None:
         with self._lock:
             try:
-                mtime = os.path.getmtime(self.path)
+                mtime = os.stat(self.path).st_mtime_ns
             except FileNotFoundError:
                 self._mtime = -1.0
                 self._entries = []
@@ -65,15 +67,10 @@ class ApiKeys:
     def _write(self) -> None:
         directory = os.path.dirname(self.path) or "."
         os.makedirs(directory, mode=0o700, exist_ok=True)
-        temp = f"{self.path}.tmp"
-        with open(temp, "w", encoding="utf-8") as handle:
-            json.dump({"keys": self._entries}, handle, indent=2, sort_keys=True)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temp, self.path)
-        os.chmod(self.path, 0o600)
-        self._mtime = os.path.getmtime(self.path)
+        write_json(self.path, {"keys": self._entries})
+        self._mtime = os.stat(self.path).st_mtime_ns
 
+    @serialized
     def create(self, scope: str = SCOPE_ACTIVAR, note: str = "") -> tuple[dict[str, Any], str]:
         """Crea una clave y la devuelve en claro. Solo se ve este momento."""
         if scope != "*" and scope not in SCOPES:
@@ -94,6 +91,7 @@ class ApiKeys:
             self._write()
             return dict(entry), key
 
+    @serialized
     def verify(self, key: str, scope: str = "") -> dict[str, Any] | None:
         """Comprueba la clave y, si se pide, que tenga ese permiso.
 
@@ -130,6 +128,7 @@ class ApiKeys:
                 reverse=True,
             )
 
+    @serialized
     def revoke(self, key_id: str) -> bool:
         with self._lock:
             self.reload()

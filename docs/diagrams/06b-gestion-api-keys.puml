@@ -1,0 +1,16 @@
+@startuml
+title Claves API y límites
+actor Operador
+participant CLI
+database ApiKeys as K
+participant Service as W
+database "SQLite limits" as L
+Operador -> CLI: apikey create --scope activar
+CLI -> K: guardar SHA-256 y scope
+CLI --> Operador: secreto sólo al crearlo
+W -> K: verify X-API-Key / scope / revocación
+W -> L: límites persistentes login/registro/canje
+Operador -> CLI: apikey revoke id
+CLI -> K: revocado = true
+note over K,W: Permisos por operador único; no son tenants.
+@enduml

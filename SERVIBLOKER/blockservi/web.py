@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import hashlib
+import ipaddress
+import json
 import os
 import secrets
-import subprocess
 import time
-from collections import defaultdict, deque
 from typing import Any
 
 from aiohttp import web
@@ -16,15 +17,15 @@ from .codes import Codes
 from .config import Config
 from .dnsfilter import Filter
 from .licenses import Licenses
-from .portal import admin_page, device_page, manual_page
-from .profile import build_profile, build_vpn_test_profile
+from .portal import admin_page, device_page, manual_page, login_page, virtual_panel
+from .profile import build_profile
 from .rules import MODE_STRICT, MODE_UNLOCKED
 from .store import Store
+from .virtual import VirtualState
+from .persistence import file_lock
+from .profile import load_identity
 
 DOH_CONTENT_TYPE = "application/dns-message"
-MAX_ATTEMPTS = 5
-ATTEMPT_WINDOW = 900
-LOCKOUT_SECONDS = 1800
 
 
 def _escape(text: str) -> str:
@@ -36,40 +37,12 @@ def _escape(text: str) -> str:
     )
 
 
-class RateLimiter:
-    def __init__(self) -> None:
-        self._attempts: dict[str, deque[float]] = defaultdict(deque)
-        self._locked: dict[str, float] = {}
-
-    def check(self, key: str) -> int:
-        now = time.time()
-        locked_until = self._locked.get(key, 0.0)
-        if locked_until > now:
-            return int(locked_until - now)
-        window = self._attempts[key]
-        while window and now - window[0] > ATTEMPT_WINDOW:
-            window.popleft()
-        return 0
-
-    def fail(self, key: str) -> None:
-        self._attempts[key].append(time.time())
-        if len(self._attempts[key]) >= MAX_ATTEMPTS:
-            self._locked[key] = time.time() + LOCKOUT_SECONDS
-            self._attempts[key].clear()
-
-    def success(self, key: str) -> None:
-        self._attempts.pop(key, None)
-        self._locked.pop(key, None)
-
-
 def admin_required(handler):
     """Exige la clave de administracion por cabecera X-Admin-Key o por ?k=."""
 
     async def wrapper(request: web.Request) -> web.StreamResponse:
         service: "Service" = request.app["service"]
-        config = service.config
-        provided = request.query.get("k") or request.headers.get("X-Admin-Key") or ""
-        if not provided or not hmac.compare_digest(provided, config.admin_key):
+        if not service._authorized(request):
             return web.json_response({"error": "no_autorizado"}, status=401)
         return await handler(service, request)
 
@@ -114,7 +87,7 @@ class Service:
         licenses: Licenses,
         codes: Codes,
         api_keys: "ApiKeys | None" = None,
-        organization: str = "BloqueoServi",
+        organization: str = "IBLOKER",
     ) -> None:
         self.config = config
         self.filter = dns_filter
@@ -123,53 +96,134 @@ class Service:
         self.codes = codes
         self.api_keys = api_keys
         self.organization = organization
-        self.limiter = RateLimiter()
+        self.virtual = VirtualState(config.data_dir)
         self.started_at = time.time()
 
     def _peer_ip(self, request: web.Request) -> str:
-        """IP real del cliente.
-
-        Caddy conecta desde 127.0.0.1 y deja la direccion del movil en
-        X-Forwarded-For. Solo se acepta esa cabecera si el peer es local, que
-        es el unico caso en que el servicio no esta expuesto directamente.
-
-        Con el perfil unico esta IP es la identidad del telefono, asi que no
-        puede falsearse. Si hay Cloudflare delante se usa CF-Connecting-IP, que
-        Cloudflare sobrescribe siempre con la direccion que ve; en cambio el
-        X-Forwarded-For lo puede mandar el cliente. De XFF se toma la primera
-        entrada, que es la que pone el proxy mas cercano al cliente, nunca las
-        que van detras.
-        """
         remote = request.remote or ""
-        connecting = request.headers.get("CF-Connecting-IP", "").strip()
-        if connecting:
-            return connecting
-        if remote.startswith("127.") or remote in ("::1", "localhost"):
-            forwarded = request.headers.get("X-Forwarded-For", "")
-            for candidate in forwarded.split(","):
-                candidate = candidate.strip()
-                if candidate:
-                    return candidate
-        return remote
+        try:
+            peer = ipaddress.ip_address(remote)
+            trusted = [ipaddress.ip_network(net) for net in self.config.trusted_proxies]
+            if not any(peer in net for net in trusted):
+                return str(peer)
+            # Descartar proxies desde la derecha. CF-Connecting-IP nunca es autoridad.
+            chain = [ipaddress.ip_address(part.strip()) for part in request.headers.get("X-Forwarded-For", "").split(",") if part.strip()]
+            for candidate in reversed(chain):
+                if not any(candidate in net for net in trusted):
+                    return str(candidate)
+            return str(peer)
+        except ValueError:
+            return remote
 
     def _token_from_request(self, request: web.Request) -> str | None:
+        token = request.match_info.get("device_token")
+        if token:
+            return token
         host = (request.headers.get("Host") or "").split(":")[0]
         return self.config.token_from_dns_host(host)
 
+    def _session_signature(self, payload: str) -> str:
+        return hmac.new(self.config.admin_key.encode(), payload.encode(), hashlib.sha256).hexdigest()
+
     def _authorized(self, request: web.Request) -> bool:
-        provided = request.query.get("k") or request.headers.get("X-Admin-Key") or ""
-        return bool(provided) and hmac.compare_digest(provided, self.config.admin_key)
+        provided = request.headers.get("X-Admin-Key", "")
+        if self.config.legacy_admin_query:
+            provided = provided or request.query.get("k", "")
+        if provided and hmac.compare_digest(provided, self.config.admin_key):
+            return True
+        cookie = request.cookies.get("iblocker_session", "")
+        try:
+            issued, nonce, signature = cookie.split(".")
+            valid = (0 <= time.time() - int(issued) < 8 * 3600 and
+                     hmac.compare_digest(signature, self._session_signature(issued + "." + nonce)))
+        except (ValueError, TypeError):
+            return False
+        if request.method not in ("GET", "HEAD"):
+            valid = valid and request.headers.get("X-IBLOKER-Request") == "1"
+        return bool(valid)
 
     def _sync_tunnel_firewall(self) -> None:
-        for cmd in (
-            "/usr/local/sbin/blockservi-sync-unlocked",
-            "/usr/local/sbin/blockservi-sync-unlocked6",
-            "/usr/local/sbin/blockservi-tunelorder",
-        ):
-            if not os.path.exists(cmd):
-                continue
-            run_cmd = [cmd] if os.geteuid() == 0 else ["sudo", "-n", cmd]
-            subprocess.run(run_cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # El controlador independiente reconcilia en <=5 s. La web no ejecuta root/sudo.
+        return None
+
+    async def handle_login(self, request):
+        if request.method == "GET":
+            return web.Response(text=login_page(), content_type="text/html")
+        if not self.virtual.allow("login:" + self._peer_ip(request), 10):
+            raise web.HTTPTooManyRequests()
+        data = await request.json()
+        if not hmac.compare_digest(str(data.get("key", "")), self.config.admin_key):
+            raise web.HTTPUnauthorized()
+        payload = f"{int(time.time())}.{secrets.token_hex(24)}"
+        response = web.json_response({"ok": True})
+        response.set_cookie("iblocker_session", payload + "." + self._session_signature(payload),
+                            secure=True, httponly=True, samesite="Strict", max_age=8 * 3600, path="/")
+        return response
+
+    async def handle_logout(self, request):
+        if not self._authorized(request):
+            raise web.HTTPUnauthorized()
+        response = web.json_response({"ok": True})
+        response.del_cookie("iblocker_session", path="/")
+        return response
+
+    @admin_required
+    async def handle_virtual_activity(self, request):
+        return web.json_response({"dns": self.filter.log.recent(50, only_blocked=False),
+                                  "stats": self.filter.stats(), "controller": self.virtual.observed()})
+
+    @admin_required
+    async def handle_virtual_devices(self, request):
+        observed = self.virtual.observed()
+        rows = []
+        contacts = self.virtual.contacts()
+        for device in self.store.list():
+            token = device["token"]
+            sessions = [sa for sa in observed.get("sessions", []) if sa["token"] == token]
+            identity = None
+            if self.config.vpn_enabled:
+                try:
+                    identity = load_identity(self.config, token, allow_expired=True)
+                except (FileNotFoundError, ValueError):
+                    pass
+            contact = contacts.get(token, {})
+            rows.append({**device, "last_contact": max(device.get("last_seen", 0), contact.get("at", 0)),
+                         "public_ip": contact.get("public_ip", "") or device.get("last_ip", ""), "unlocked_until": self.store.effective_until(token), "state": self.store.state(token),
+                         "dns": "seen" if device.get("last_seen") else "never_seen",
+                         "vpn": "connected" if sessions and observed.get("fresh") and observed.get("healthy") else "unknown" if not observed.get("fresh") else "disconnected",
+                         "sessions": sessions, "profile_ready": not self.config.vpn_enabled or bool(identity and identity["expires_at"] > time.time()),
+                         "credential_expires_at": identity["expires_at"] if identity else 0,
+                         "activation_url": self.config.activation_url(token)})
+        return web.json_response({"devices": rows, "controller": observed, "vpn_enabled": self.config.vpn_enabled})
+
+    @admin_required
+    async def handle_virtual_create(self, request):
+        data = await request.json()
+        device = await asyncio.to_thread(self.store.add, str(data.get("label", "")))
+        return web.json_response({"ok": True, "token": device["token"],
+                                  "profile_url": f"/perfil/{device['token']}.mobileconfig",
+                                  "provisioning": self.config.vpn_enabled}, status=201)
+
+    @admin_required
+    async def handle_virtual_action(self, request):
+        token = request.match_info["token"]
+        action = request.match_info["action"]
+        if not self.store.device(token):
+            raise web.HTTPNotFound()
+        data = await request.json()
+        if action == "unlock":
+            hours = int(data.get("hours", 24))
+            license_code = str(data.get("license", ""))
+            if license_code and not self.licenses.check(license_code).ok:
+                raise web.HTTPForbidden(text="licencia_invalida")
+            await asyncio.to_thread(self.store.unlock, token, license_code, hours)
+        elif action == "lock":
+            await asyncio.to_thread(self.store.set_unlocked_until, token, 0)
+        elif action == "revoke":
+            await asyncio.to_thread(self.store.revoke_credential, token)
+        else:
+            raise web.HTTPNotFound()
+        return web.json_response({"ok": True, "state": self.store.state(token), "firewall": "pending_reconciliation"})
 
     async def handle_doh(self, request: web.Request) -> web.StreamResponse:
         if request.method == "GET":
@@ -199,7 +253,7 @@ class Service:
         return web.Response(
             body=reply,
             content_type=DOH_CONTENT_TYPE,
-            headers={"Cache-Control": "max-age=0", "X-Device": token or "desconocido"},
+            headers={"Cache-Control": "max-age=0"},
         )
 
     async def handle_health(self, request: web.Request) -> web.StreamResponse:
@@ -228,7 +282,7 @@ class Service:
         if not self.config.captive_ip:
             raise web.HTTPFound("/activar")
         ip = self._peer_ip(request)
-        resolved = await asyncio.to_thread(self.store.token_by_ip, ip)
+        resolved = None  # La IP pública nunca revela la identidad de otro dispositivo.
         if resolved:
             return await self._device_page(request, resolved)
         # Sin token en el Host y sin equipo conocido: con el perfil unico esta es
@@ -243,13 +297,13 @@ class Service:
 
     def _device_view(self, token: str) -> dict[str, Any]:
         device = self.store.device(token)
-        unlocked_until = int((device or {}).get("unlocked_until", 0))
+        unlocked_until = self.store.effective_until(token)
         remaining = unlocked_until - int(time.time())
         return {
             "token": token,
             "label": (device or {}).get("label", ""),
             "conocido": device is not None,
-            "modo": MODE_UNLOCKED if remaining > 0 else MODE_STRICT,
+            "modo": self.store.mode(token),
             "desbloqueado_hasta": unlocked_until if remaining > 0 else None,
             "horas_restantes": round(remaining / 3600, 2) if remaining > 0 else 0,
         }
@@ -320,6 +374,22 @@ class Service:
             headers={"Cache-Control": "no-store"},
         )
 
+    def _device_request_code(self, token, ip):
+        with file_lock(os.path.join(self.config.data_dir, "activation.lock")):
+            # Evitar colisiones con códigos históricos/pregenerados, además de solicitudes Store.
+            for _ in range(64):
+                code = self.store.request(token)
+                existing = self.codes.get(code)
+                if existing and (existing.get("token") != token or existing.get("usado_at") or existing.get("revoked_at")):
+                    self.store._clear_request(token)
+                    continue
+                try:
+                    self.codes.register(code, token, ip)
+                    return code
+                except ValueError:
+                    self.store._clear_request(token)
+            raise ValueError("no_quedan_codigos_disponibles")
+
     async def handle_request_api(self, request: web.Request) -> web.StreamResponse:
         """El movil pide su codigo y consulta si ya le han autorizado.
 
@@ -327,13 +397,19 @@ class Service:
         token, asi que el telefono se identifica por la IP desde la que pide.
         """
         token = (request.match_info.get("token") or "").strip().lower()
+        if not self.virtual.allow("request:" + self._peer_ip(request), 120, 60):
+            raise web.HTTPTooManyRequests()
         nuevo = bool(request.query.get("nuevo"))
         try:
             if token:
+                if self.store.state(token) == "REVOKED":
+                    raise web.HTTPForbidden(text="credencial_revocada")
                 if nuevo:
-                    await asyncio.to_thread(self.store.request, token)
+                    await asyncio.to_thread(self._device_request_code, token, self._peer_ip(request))
                 info = await asyncio.to_thread(self.store.request_info, token)
             else:
+                if not self.config.trust_ip:
+                    raise web.HTTPUnauthorized(text="perfil_individual_requerido")
                 ip = self._peer_ip(request)
                 if not ip:
                     return web.json_response({"error": "sin_identificar"}, status=400)
@@ -371,39 +447,25 @@ class Service:
             return web.json_response({"error": "codigo_invalido"}, status=400)
         if token and not self.store.device(token):
             return web.json_response({"error": "equipo_desconocido"}, status=404)
-        if not token and not ip:
+        if not token and (not self.config.trust_ip or not ip):
             return web.json_response({"error": "sin_identificar"}, status=400)
-        hours, entry = await asyncio.to_thread(self.codes.redeem, code, token, ip)
-        if entry is None:
-            return web.json_response(
-                {"error": "codigo_no_valido", "detalle": "ese codigo no existe o ya se uso"},
-                status=403,
-            )
-        if token:
-            device = await asyncio.to_thread(self.store.unlock, token, "", hours)
-        else:
-            device = await asyncio.to_thread(self.store.unlock_ip, ip, "", hours)
-        await asyncio.to_thread(self.codes.activate, code, hours, "canje")
-        return web.json_response(
-            {
-                "ok": True,
-                "horas": hours,
-                "token": token,
-                "ip": ip if not token else "",
-                "label": device.get("label", ""),
-                "unlocked_until": int(device["unlocked_until"]),
-            }
-        )
+        if token and self.store.state(token) == "REVOKED":
+            raise web.HTTPForbidden(text="credencial_revocada")
+        if not self.virtual.allow("redeem:" + self._peer_ip(request), 10):
+            raise web.HTTPTooManyRequests()
+        result = await asyncio.to_thread(self._redeem_transaction, code, token, ip)
+        if result is None:
+            return web.json_response({"error": "codigo_no_valido"}, status=403)
+        return web.json_response(result)
 
     @admin_required
     async def handle_revoke(self, request: web.Request) -> web.StreamResponse:
-        """Deja de valer un codigo ya activado, sin tocar el resto del equipo."""
+        """Revoca el código y la autorización de su identidad asociada."""
         data = await request.json()
         code = str(data.get("codigo", "")).strip()
         if not code:
             return web.json_response({"error": "codigo_vacio"}, status=400)
-        entry = await asyncio.to_thread(self.codes.revoke, code)
-        if not entry:
+        if not await asyncio.to_thread(self._revoke_code, code):
             return web.json_response({"error": "codigo_no_encontrado"}, status=404)
         return web.json_response({"ok": True, "codigo": code})
 
@@ -420,10 +482,16 @@ class Service:
         token = (data.get("token") or request.query.get("token") or "").strip().lower()
         if token and not self.store.device(token):
             return web.json_response({"error": "equipo_desconocido"}, status=404)
+        if not token and not self.config.trust_ip:
+            raise web.HTTPUnauthorized(text="perfil_individual_requerido")
+        if token and self.store.state(token) == "REVOKED":
+            raise web.HTTPForbidden()
+        if not self.virtual.allow("register:" + self._peer_ip(request), 30):
+            raise web.HTTPTooManyRequests()
         entrada = await asyncio.to_thread(
             self.codes.register, code, token, self._peer_ip(request)
         )
-        return web.json_response(entrada, headers={"Cache-Control": "no-store"})
+        return web.json_response({"id": entrada["id"], "active": False}, headers={"Cache-Control": "no-store"})
 
     async def handle_code_state(self, request: web.Request) -> web.StreamResponse:
         """Consulta el estado de un codigo. Solo el suyo: pide el codigo entero."""
@@ -433,7 +501,15 @@ class Service:
         entrada = await asyncio.to_thread(self.codes.get, code)
         if entrada is None:
             return web.json_response({"error": "codigo_no_encontrado"}, status=404)
-        return web.json_response(entrada, headers={"Cache-Control": "no-store"})
+        token = request.headers.get("X-Device-Token", "")
+        if entrada.get("token"):
+            if not hmac.compare_digest(token, entrada["token"]):
+                raise web.HTTPNotFound()
+        elif not self.config.trust_ip or entrada.get("ip") != self._peer_ip(request):
+            raise web.HTTPNotFound()
+        active = entrada["active"] and (self.store.mode(token) == MODE_UNLOCKED if token else self.store.mode_for("", self._peer_ip(request)) == MODE_UNLOCKED)
+        return web.json_response({"id": code, "active": active,
+                                  "expires_at": entrada["expires_at"]}, headers={"Cache-Control": "no-store"})
 
     @admin_required
     async def handle_codes_list(self, request: web.Request) -> web.StreamResponse:
@@ -451,9 +527,8 @@ class Service:
         devices = await asyncio.to_thread(self.store.list)
         licenses = await asyncio.to_thread(self.licenses.inventory)
         codigos = await asyncio.to_thread(self.codes.list)
-        # La clave llega en la query, asi que hay que pasarsela a la pagina: si no,
-        # los botones que llama el navegador se quedan sin autorizacion.
-        key = request.query.get("k") or request.headers.get("X-Admin-Key") or ""
+        # La sesión HttpOnly autentica el panel; nunca se inserta admin_key en HTML.
+        key = ""
         body = admin_page(
             requests,
             devices,
@@ -464,7 +539,7 @@ class Service:
             key=key,
         )
         return web.Response(
-            text=body, content_type="text/html", headers={"Cache-Control": "no-store"}
+            text=body.replace("</main>", virtual_panel() + "</main>"), content_type="text/html", headers={"Cache-Control": "no-store"}
         )
 
     @admin_required
@@ -480,58 +555,58 @@ class Service:
         await asyncio.to_thread(self.store.set_ip_unlocked_until, ip, 0)
         return web.json_response({"ok": True, "ip": ip})
 
-    async def _activar(
-        self,
-        code: str,
-        hours: int,
-        license_code: str,
-        origen: str,
-        ip_forzada: str = "",
-    ) -> tuple[int, dict]:
-        """Activa un codigo. Lo usan el panel y la API, para que se comporten igual.
+    def _activate_transaction(self, code, hours, license_code, origen, ip_forzada=""):
+        if not 1 <= int(hours) <= 2160:
+            raise ValueError("horas_invalidas")
+        with file_lock(os.path.join(self.config.data_dir, "activation.lock")):
+            registro = self.codes.get(code)
+            if registro and (registro.get("usado_at") or registro.get("revoked_at")):
+                return 409, {"error": "codigo_ya_utilizado_o_revocado"}
+            token = (registro or {}).get("token") or self.store.find_by_request_code(code)
+            ip = (registro or {}).get("ip") or self.store.find_ip_by_request_code(code)
+            # Los clientes API no pueden redirigir una solicitud a una IP diferente.
+            if ip_forzada and ip_forzada != ip:
+                return 400, {"error": "ip_no_coincide"}
+            if token:
+                if self.store.state(token) == "REVOKED":
+                    return 403, {"error": "credencial_revocada"}
+            elif not self.config.trust_ip or not ip:
+                return 404, {"error": "codigo_no_encontrado"}
+            if registro:
+                self.codes.activate(code, hours, origen)
+            self.store.deny(code)
+            # Si el proceso se interrumpe tras consumir, no se concede acceso nuevo.
+            device = self.store.unlock(token, license_code, hours) if token else self.store.unlock_ip(ip, license_code, hours)
+            return 0, {"ok": True, "token": token or "", "ip": "" if token else ip,
+                       "label": device.get("label", ""), "abierto": [token or ip],
+                       "unlocked_until": self.store.effective_until(token) if token else device["unlocked_until"], "hours": hours}
 
-        Un codigo puede pertenecer a un equipo con token (instalacion antigua), a
-        un telefono con el perfil unico (que solo tiene IP) o a las dos cosas, si
-        el telefono abrio la pagina de un equipo antiguo. Se abren TODAS las
-        identidades que resuelve el codigo: si solo se abriera una, activarlo
-        devolveria ok y el movil seguiria sin salida, que es lo que mas confunde.
-        """
-        registro = await asyncio.to_thread(self.codes.get, code)
-        token = (registro or {}).get("token") or await asyncio.to_thread(
-            self.store.find_by_request_code, code
-        )
-        ip = ip_forzada or (registro or {}).get("ip") or await asyncio.to_thread(
-            self.store.find_ip_by_request_code, code
-        )
-        if not token and not ip:
-            return 404, {"error": "codigo_no_encontrado"}
+    async def _activar(self, code, hours, license_code, origen, ip_forzada=""):
+        return await asyncio.to_thread(self._activate_transaction, code, hours, license_code, origen, ip_forzada)
 
-        etiquetas: list[str] = []
-        hasta = 0
-        if token and await asyncio.to_thread(self.store.device, token):
-            device = await asyncio.to_thread(self.store.unlock, token, license_code, hours)
-            hasta = int(device["unlocked_until"])
-            etiquetas.append(f"equipo {token} ({device.get('label') or 'sin etiqueta'})")
-        if ip:
-            # El perfil unico identifica al telefono por su IP, con o sin token.
-            acceso = await asyncio.to_thread(self.store.unlock_ip, ip, license_code, hours)
-            hasta = max(hasta, int(acceso["unlocked_until"]))
-            etiquetas.append(f"ip {ip}")
+    def _revoke_code(self, code):
+        with file_lock(os.path.join(self.config.data_dir, "activation.lock")):
+            record = self.codes.get(code)
+            if not record or not self.codes.revoke(code):
+                return False
+            token = record.get("token")
+            if token and self.store.device(token):
+                self.store.set_unlocked_until(token, 0)
+            elif self.config.trust_ip and record.get("ip"):
+                self.store.set_ip_unlocked_until(record["ip"], 0)
+            return True
 
-        if registro:
-            await asyncio.to_thread(self.codes.activate, code, hours, origen)
-        else:
-            await asyncio.to_thread(self.store.deny, code)
-        await asyncio.to_thread(self._sync_tunnel_firewall)
-        return 0, {
-            "ok": True,
-            "token": token if isinstance(token, str) else "",
-            "ip": ip if isinstance(ip, str) else "",
-            "label": etiquetas[0] if etiquetas else "",
-            "abierto": etiquetas,
-            "unlocked_until": hasta,
-            "hours": hours,
-        }
+    def _redeem_transaction(self, code, token, ip):
+        with file_lock(os.path.join(self.config.data_dir, "activation.lock")):
+            if token and self.store.state(token) == "REVOKED":
+                return None
+            hours, entry = self.codes.redeem(code, token, ip)
+            if entry is None:
+                return None
+            self.codes.activate(code, hours, "canje")
+            device = self.store.unlock(token, "", hours) if token else self.store.unlock_ip(ip, "", hours)
+            return {"ok": True, "horas": hours, "token": token, "ip": "" if token else ip,
+                    "label": device.get("label", ""), "unlocked_until": device["unlocked_until"]}
 
     @admin_required
     async def handle_approve(self, request: web.Request) -> web.StreamResponse:
@@ -541,6 +616,11 @@ class Service:
         license_code = str(data.get("licencia", "")).strip().upper()
         if not code:
             return web.json_response({"error": "codigo_vacio"}, status=400)
+        if data.get("individual_only"):
+            record = await asyncio.to_thread(self.codes.get, code)
+            owner = (record or {}).get("token") or await asyncio.to_thread(self.store.find_by_request_code, code)
+            if not owner or not await asyncio.to_thread(self.store.device, owner):
+                return web.json_response({"error": "perfil_individual_requerido"}, status=403)
         if license_code:
             result = await asyncio.to_thread(self.licenses.check, license_code)
             if not result.ok:
@@ -591,24 +671,21 @@ class Service:
     async def handle_api_revocar(self, request: web.Request) -> web.StreamResponse:
         data = await request.json()
         code = str(data.get("codigo") or data.get("code") or "").strip()
-        hours = int(data.get("horas", 0))
         if not code:
             return web.json_response({"error": "codigo_vacio"}, status=400)
         registro = await asyncio.to_thread(self.codes.get, code)
         if registro is None:
             return web.json_response({"error": "codigo_no_encontrado"}, status=404)
-        ip = registro.get("ip", "")
-        await asyncio.to_thread(self.codes.revoke, code)
-        if ip and hours >= 0:
-            await asyncio.to_thread(self.store.set_ip_unlocked_until, ip, 0)
-        return web.json_response({"ok": True, "codigo": code, "ip": ip})
+        await asyncio.to_thread(self._revoke_code, code)
+        return web.json_response({"ok": True, "codigo": code})
 
     @admin_required
     async def handle_deny(self, request: web.Request) -> web.StreamResponse:
         data = await request.json()
         code = str(data.get("codigo", "")).strip()
         token = await asyncio.to_thread(self.store.deny, code)
-        if token is None:
+        found = await asyncio.to_thread(self.codes.revoke, code)
+        if token is None and not found:
             return web.json_response({"error": "codigo_no_encontrado"}, status=404)
         return web.json_response({"ok": True, "token": token})
 
@@ -650,7 +727,12 @@ class Service:
         token = (request.match_info.get("token") or "").strip().lower()
         if not self.store.device(token):
             return web.Response(status=404, text="dispositivo desconocido")
-        profile = build_profile(self.config, token, self.organization)
+        if self.store.state(token) == "REVOKED":
+            raise web.HTTPForbidden(text="credencial_revocada")
+        try:
+            profile = build_profile(self.config, token, self.organization, profile_uuid=self.store.device(token).get("profile_uuid"), wifi=(await request.json()).get("wifi") if request.method == "POST" else None)
+        except FileNotFoundError:
+            return web.json_response({"error": "certificado_pendiente"}, status=409)
         return web.Response(
             body=profile,
             content_type="application/x-apple-aspen-config",
@@ -670,6 +752,8 @@ class Service:
         """
         if not self._authorized(request):
             return web.Response(status=401, text="no autorizado")
+        if not self.config.trust_ip:
+            raise web.HTTPGone(text="use_perfil_individual")
         profile = build_profile(
             self.config, "todos", self.organization, doh_url=self.config.shared_doh_url()
         )
@@ -684,6 +768,8 @@ class Service:
 
     async def handle_short_config(self, request: web.Request) -> web.StreamResponse:
         """URL corta publica para instalar el perfil comun desde el iPhone."""
+        if not self.config.trust_ip:
+            raise web.HTTPGone(text="use_perfil_individual")
         profile = build_profile(
             self.config, "todos", self.organization, doh_url=self.config.shared_doh_url()
         )
@@ -700,20 +786,43 @@ class Service:
         """Perfil minimo solo-VPN, para diagnosticar IKEv2 en iOS."""
         if not self._authorized(request):
             return web.Response(status=401, text="no autorizado")
-        profile = build_vpn_test_profile(self.config)
-        return web.Response(
-            body=profile,
-            content_type="application/x-apple-aspen-config",
-            headers={
-                "Content-Disposition": 'attachment; filename="vpn-test.mobileconfig"',
-                "Cache-Control": "no-store",
-            },
-        )
+        raise web.HTTPGone(text="use_perfil_individual_con_certificado")
 
     def build_app(self) -> web.Application:
-        app = web.Application(client_max_size=64 * 1024)
+        @web.middleware
+        async def guard(request, handler):
+            try:
+                # CSRF: cabecera no simple + mismo origen en login y escrituras de cookie.
+                if request.method not in ("GET", "HEAD", "OPTIONS"):
+                    if request.content_type == "application/json":
+                        data = await request.json()
+                        if not isinstance(data, dict):
+                            raise ValueError("JSON debe ser objeto")
+                    origin = request.headers.get("Origin")
+                    if origin and origin != self.config.portal_origin():
+                        raise web.HTTPForbidden(text="origen_invalido")
+                if request.path == "/panel" and not self._authorized(request):
+                    raise web.HTTPFound("/login")
+                result = await handler(request)
+            except (ValueError, TypeError, json.JSONDecodeError):
+                result = web.json_response({"error": "datos_invalidos"}, status=400)
+            except KeyError:
+                result = web.json_response({"error": "no_encontrado"}, status=404)
+            result.headers["Referrer-Policy"] = "no-referrer"
+            result.headers["X-Content-Type-Options"] = "nosniff"
+            result.headers["Cache-Control"] = "no-store"
+            result.headers["X-Frame-Options"] = "DENY"
+            return result
+        app = web.Application(client_max_size=64 * 1024, middlewares=[guard])
         app["config"] = self.config
         app["service"] = self
+        app.router.add_get("/login", self.handle_login)
+        app.router.add_post("/login", self.handle_login)
+        app.router.add_post("/logout", self.handle_logout)
+        app.router.add_get("/api/virtual/activity", self.handle_virtual_activity)
+        app.router.add_get("/api/virtual/devices", self.handle_virtual_devices)
+        app.router.add_post("/api/virtual/devices", self.handle_virtual_create)
+        app.router.add_post("/api/virtual/devices/{token}/{action}", self.handle_virtual_action)
         app.router.add_get("/", self.handle_landing)
         app.router.add_get("/activar", self.handle_activate_get)
         # La web de codigos, con el mismo nombre que tenia antes. Aqui el
@@ -722,6 +831,7 @@ class Service:
         app.router.add_get("/config", self.handle_short_config)
         app.router.add_get("/activar/{token}", self.handle_activate_get)
         app.router.add_route("*", self.config.doh_path, self.handle_doh)
+        app.router.add_route("*", self.config.doh_path + "/{device_token}", self.handle_doh)
         app.router.add_get("/salud", self.handle_health)
         app.router.add_get("/panel", self.handle_panel)
         app.router.add_get("/api/pedido", self.handle_request_api)
@@ -744,4 +854,5 @@ class Service:
         app.router.add_get("/perfil/vpn-test.mobileconfig", self.handle_vpn_test_profile)
         app.router.add_get("/perfil/bloqueoservi.mobileconfig", self.handle_shared_profile)
         app.router.add_get("/perfil/{token}.mobileconfig", self.handle_profile)
+        app.router.add_post("/perfil/{token}.mobileconfig", self.handle_profile)
         return app

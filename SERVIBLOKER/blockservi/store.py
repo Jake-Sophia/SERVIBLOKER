@@ -5,11 +5,14 @@ import os
 import secrets
 import threading
 import time
+import uuid
 from typing import Any
+
+from .persistence import serialized, write_json
 
 from .rules import MODE_STRICT, MODE_UNLOCKED
 
-TOKEN_BYTES = 6
+TOKEN_BYTES = 24
 TOUCH_INTERVAL = 600
 REQUEST_TTL = 12 * 3600
 REQUEST_CODE_RANGE = 1000000
@@ -22,8 +25,9 @@ class Store:
     hechas desde el panel en PHP o desde la CLI se aplican sin reiniciar.
     """
 
-    def __init__(self, path: str) -> None:
+    def __init__(self, path: str, licenses=None) -> None:
         self.path = path
+        self.licenses = licenses
         self._lock = threading.RLock()
         self._mtime: float = -1.0
         self._devices: dict[str, dict[str, Any]] = {}
@@ -38,7 +42,7 @@ class Store:
     def reload(self) -> None:
         with self._lock:
             try:
-                mtime = os.path.getmtime(self.path)
+                mtime = os.stat(self.path).st_mtime_ns
             except FileNotFoundError:
                 self._mtime = -1.0
                 self._devices = {}
@@ -70,15 +74,8 @@ class Store:
     def _write(self) -> None:
         directory = os.path.dirname(self.path) or "."
         os.makedirs(directory, mode=0o700, exist_ok=True)
-        temp = f"{self.path}.tmp"
-        payload = json.dumps({"devices": self._devices, "ips": self._ips}, indent=2, sort_keys=True)
-        with open(temp, "w", encoding="utf-8") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temp, self.path)
-        os.chmod(self.path, 0o600)
-        self._mtime = os.path.getmtime(self.path)
+        write_json(self.path, {"devices": self._devices, "ips": self._ips})
+        self._mtime = os.stat(self.path).st_mtime_ns
 
     def _schedule_write(self) -> None:
         self._write()
@@ -90,12 +87,15 @@ class Store:
                 if token not in self._devices:
                     return token
 
+    @serialized
     def add(self, label: str = "", code: str = "") -> dict[str, Any]:
         with self._lock:
             token = self.new_token()
             now = int(time.time())
             device = {
                 "label": label.strip()[:80],
+                "profile_uuid": str(uuid.uuid4()),
+                "credential_revoked_at": 0,
                 "code": code.strip().upper()[:40],
                 "created_at": now,
                 "unlocked_until": 0,
@@ -123,21 +123,27 @@ class Store:
             device = self._devices.get(token)
             if not device:
                 return MODE_STRICT
-            if int(device.get("unlocked_until", 0)) > int(time.time()):
+            if not device.get("credential_revoked_at") and self.effective_until(token) > int(time.time()):
                 return MODE_UNLOCKED
             return MODE_STRICT
 
+    @serialized
     def unlock(self, token: str, code: str, hours: int) -> dict[str, Any]:
         with self._lock:
             self.reload()
             device = self._devices.get(token)
             if device is None:
                 raise KeyError(token)
+            if device.get("credential_revoked_at"):
+                raise ValueError("credencial_revocada")
+            if not 1 <= int(hours) <= 2160:
+                raise ValueError("horas_invalidas")
             now = int(time.time())
             device["unlocked_until"] = now + max(1, int(hours)) * 3600
             device["unlock_count"] = int(device.get("unlock_count", 0)) + 1
             if code:
                 device["code"] = code.strip().upper()[:40]
+            device["authorization_license"] = code.strip().upper()
             device["last_unlock_at"] = now
             self._schedule_write()
             return dict(device, token=token)
@@ -161,6 +167,7 @@ class Store:
                     return MODE_UNLOCKED
         return MODE_STRICT
 
+    @serialized
     def unlock_ip(self, ip: str, code: str, hours: int) -> dict[str, Any]:
         """Abre la ventana de acceso de una direccion IP.
 
@@ -183,6 +190,7 @@ class Store:
             self._schedule_write()
             return dict(entry, ip=ip)
 
+    @serialized
     def set_ip_unlocked_until(self, ip: str, timestamp: int) -> bool:
         ip = str(ip or "").strip()
         if not ip:
@@ -199,6 +207,7 @@ class Store:
             self._schedule_write()
             return True
 
+    @serialized
     def note_ip_seen(self, ip: str) -> None:
         """Deja constancia de que esa IP ha consultado, para verla en el panel."""
         ip = str(ip or "").strip()
@@ -239,6 +248,7 @@ class Store:
                 )
         return sorted(rows, key=lambda row: row["last_unlock_at"] or row["last_seen"], reverse=True)
 
+    @serialized
     def set_unlocked_until(self, token: str, timestamp: int) -> dict[str, Any]:
         with self._lock:
             self.reload()
@@ -249,6 +259,7 @@ class Store:
             self._schedule_write()
             return dict(device, token=token)
 
+    @serialized
     def delete(self, token: str) -> bool:
         with self._lock:
             self.reload()
@@ -261,12 +272,13 @@ class Store:
     # --- codigos que solicita el propio dispositivo -----------------------
 
     def _new_request_code(self) -> str:
-        taken = {str(entry.get("request_code") or "") for entry in self._devices.values()}
+        taken = {str(entry.get("request_code") or "") for entry in [*self._devices.values(), *self._ips.values()]}
         while True:
             code = f"{secrets.randbelow(REQUEST_CODE_RANGE):06d}"
             if code not in taken:
                 return code
 
+    @serialized
     def request(self, token: str) -> str:
         """Codigo de 6 digitos que el dispositivo ensena al administrador.
 
@@ -308,7 +320,7 @@ class Store:
                 "ip": str(device.get("last_ip") or ""),
                 "modo": self.mode(token),
                 "visto": int(device.get("last_seen", 0)),
-                "desbloqueado_hasta": int(device.get("unlocked_until", 0)),
+                "desbloqueado_hasta": self.effective_until(token),
             }
 
     def _ip_bucket(self, ip: str) -> dict[str, Any]:
@@ -318,6 +330,7 @@ class Store:
         entry = self._ips.setdefault(ip, {"unlocked_until": 0, "unlock_count": 0})
         return entry
 
+    @serialized
     def request_ip(self, ip: str, nuevo: bool = False) -> str:
         """Codigo de 6 digitos de un telefono con el perfil unico.
 
@@ -377,6 +390,7 @@ class Store:
                 return ip
         return ""
 
+    @serialized
     def _clear_request_ip(self, ip: str) -> None:
         with self._lock:
             self.reload()
@@ -427,6 +441,7 @@ class Store:
                 )
         return sorted(rows, key=lambda row: row["solicitado"], reverse=True)
 
+    @serialized
     def approve(self, code: str, hours: int, license_code: str = "") -> dict[str, Any]:
         """Autoriza a quien ensena ese codigo y se lo deja sin codigo.
 
@@ -445,6 +460,7 @@ class Store:
         self._clear_request_ip(ip)
         return dict(entry, token="", ip=ip)
 
+    @serialized
     def deny(self, code: str) -> str | None:
         """Rechaza la solicitud. Devuelve el token afectado, o "" si fue por IP."""
         token = self.find_by_request_code(code)
@@ -464,7 +480,7 @@ class Store:
         with self._lock:
             self.reload()
             for token, device in self._devices.items():
-                if str(device.get("request_code") or "") == code:
+                if str(device.get("request_code") or "") == code and int(time.time()) - int(device.get("requested_at", 0)) < REQUEST_TTL:
                     return token
         return None
 
@@ -484,6 +500,7 @@ class Store:
                     best = (seen, token)
         return best[1] if best else None
 
+    @serialized
     def _clear_request(self, token: str) -> None:
         with self._lock:
             device = self._devices.get(token)
@@ -493,6 +510,7 @@ class Store:
             device["requested_at"] = 0
             self._schedule_write()
 
+    @serialized
     def note_ip(self, token: str | None, ip: str) -> None:
         if not token or not ip:
             return
@@ -512,6 +530,7 @@ class Store:
                 dict(device, token=token) for token, device in sorted(self._devices.items())
             ]
 
+    @serialized
     def touch(self, token: str | None) -> None:
         """Marca actividad. Solo escribe en disco de vez en cuando."""
         if not token:
@@ -528,8 +547,41 @@ class Store:
                 self._dirty_touch.clear()
                 self._schedule_write()
 
+    @serialized
     def flush(self) -> None:
         with self._lock:
             if self._dirty_touch:
                 self._dirty_touch.clear()
                 self._schedule_write()
+
+    def state(self, token: str, now: int | None = None) -> str:
+        device = self.device(token)
+        if not device or device.get("credential_revoked_at"):
+            return "REVOKED"
+        now = int(time.time()) if now is None else now
+        until = self.effective_until(token)
+        if until > now:
+            return "UNLOCKED"
+        return "EXPIRED" if until else "RESTRICTED"
+
+    @serialized
+    def revoke_credential(self, token: str) -> None:
+        device = self._devices[token]
+        device["credential_revoked_at"] = int(time.time())
+        device["unlocked_until"] = 0
+        device["request_code"] = ""
+        self._write()
+
+    def effective_until(self, token: str) -> int:
+        device = self.device(token)
+        if not device or device.get("credential_revoked_at"):
+            return 0
+        until = int(device.get("unlocked_until", 0))
+        code = device.get("authorization_license", "")
+        if code and self.licenses:
+            result = self.licenses.check(code)
+            if not result.ok:
+                return min(until, int(time.time()) - 1)
+            if result.expires_at:
+                until = min(until, result.expires_at)
+        return until

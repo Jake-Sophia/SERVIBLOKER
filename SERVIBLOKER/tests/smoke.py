@@ -18,28 +18,19 @@ SIEMPRE_PERMITIDO = [
     "m.youtube.com",
     "youtubei.googleapis.com",
     "i.ytimg.com",
-    "t.me",
-    "telegram.org",
-    "web.telegram.org",
-    "cdn-telegram.org",
     "captive.apple.com",
     "time.apple.com",
+    "p72-fmip.icloud.com",
+    "gspe35-ssl.ls.apple.com",
 ]
 
-SIEMPRE_BLOQUEADO = [
-    "itunes.apple.com",
-    "secure.itunes.apple.com",
-    "xp.apple.com",
-    "books.apple.com",
-    "phobos.apple.com",
-    "gspe35-ssl.ls.apple.com",
-    "p01-contactsync.icloud.com",
-    "fmzmobile.icloud.com",
-    "dns.google",
-    "cloudflare-dns.com",
-]
+SIEMPRE_BLOQUEADO = ["dns.google", "cloudflare-dns.com"]
 
 SOLO_ESTRICTO = [
+    "t.me",
+    "telegram.org",
+    "messenger.com",
+    "whatsapp.net",
     "instagram.com",
     "x.com",
     "tiktok.com",
@@ -91,7 +82,7 @@ class Cliente:
 
     def estado(self, token: str, key: str) -> dict:
         request = urllib.request.Request(
-            f"{self.base}/api/estado/{token}?k={key}", headers={"Host": self.host}
+            f"{self.base}/api/estado/{token}", headers={"Host": self.host, "X-Admin-Key": key}
         )
         try:
             with urllib.request.urlopen(request, timeout=self.timeout, context=self.tls) as response:

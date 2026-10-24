@@ -9,7 +9,7 @@ from .upstream import Upstream, UpstreamError
 
 BLOCK_ZONE = "blocked.local."
 BLOCK_SOA = SOA("ns.blocked.local.", "hostmaster.blocked.local.", (1, 3600, 600, 604800, 60))
-SUPPORTED_QTYPES = {1, 2, 5, 12, 15, 16, 28, 33, 35, 43, 48, 65, 257}
+SUPPORTED_QTYPES = {1, 2, 5, 6, 12, 15, 16, 28, 33, 35, 43, 46, 47, 48, 50, 51, 64, 65, 257}
 SOA_TYPE = int(QTYPE.SOA)
 A_TYPE = int(QTYPE.A)
 AAAA_TYPE = int(QTYPE.AAAA)
@@ -27,8 +27,12 @@ class Filter:
         log: QueryLog,
         blocked_rcode: str = "nxdomain",
         captive_ip: str = "",
+        trust_ip: bool = False,
+        virtual=None,
     ) -> None:
         self.policy = policy
+        self.trust_ip = trust_ip
+        self.virtual = virtual
         self.store = store
         self.upstream = upstream
         self.log = log
@@ -47,7 +51,7 @@ class Filter:
         header.tc = 0
         header.rcode = rcode
         reply = DNSRecord(header=header)
-        reply.questions = [DNSQuestion(str(request.q.qname), request.q.qtype)]
+        reply.questions = [DNSQuestion(str(request.q.qname), request.q.qtype)] if request.questions else []
         return reply
 
     def blocked_reply(self, request: DNSRecord) -> bytes:
@@ -93,6 +97,7 @@ class Filter:
 
         if device:
             self.store.note_ip(device, client_ip)
+            self.store.touch(device)
 
         if len(request.questions) > 1:
             return self.error_reply(request, RCODE.FORMERR)
@@ -103,9 +108,12 @@ class Filter:
 
         # El modo sale del token si lo hay (perfil por equipo) y, si no, de la IP
         # (perfil unico para todos). Sin ninguno de los dos, estado de espera.
-        mode = self.store.mode_for(device, client_ip)
+        mode = self.store.mode_for(device, client_ip if self.trust_ip else "")
         if client_ip and not device:
             self.store.note_ip_seen(client_ip)
+
+        if device and self.store.state(device) == "REVOKED":
+            return self.error_reply(request, RCODE.REFUSED)
 
         denied = self.policy.check_qtype(qtype_name)
         if denied is not None:
@@ -129,7 +137,12 @@ class Filter:
         self._count(ALLOWED)
         self.store.touch(device)
         try:
-            return await self.upstream.resolve(wire)
+            reply = await self.upstream.resolve(wire)
+            if self.virtual and self.policy.decide(name, MODE_STRICT).allow:
+                parsed = DNSRecord.parse(reply)
+                self.virtual.learn(name, [(str(rr.rdata), int(rr.ttl)) for rr in parsed.rr
+                                          if int(rr.rtype) in (A_TYPE, AAAA_TYPE)])
+            return reply
         except UpstreamError as exc:
             self._count(ERROR)
             self.log.record(ERROR, name, qtype_name, f"upstream: {exc}", device or "-", mode)
